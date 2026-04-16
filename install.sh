@@ -845,6 +845,19 @@ stop_nohup_supervisor() {
   stop_nohup_daemon
 }
 
+stop_existing_service() {
+  if [ "$PLATFORM" = "Darwin" ]; then
+    launchctl unload "$PLIST_PATH" >/dev/null 2>&1 || true
+  else
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --user stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    fi
+    stop_nohup_supervisor
+  fi
+
+  stop_nohup_daemon
+}
+
 install_nohup_supervisor() {
   local pid_path supervisor_path
   pid_path="$(nohup_supervisor_pid_path)"
@@ -1014,6 +1027,8 @@ EOF
 }
 
 main() {
+  local should_clear_runtime_state=0
+
   detect_platform
   detect_uv
   detect_python
@@ -1030,15 +1045,17 @@ main() {
   [ "$CLI_SECRET_ACCESS_KEY" -eq 1 ] || SECRET_ACCESS_KEY=""
 
   if [ "$HAS_EXISTING_INSTALL" -eq 1 ]; then
-    local should_clear_runtime_state=0
     prompt_yes_no should_clear_runtime_state "Existing install detected. Clear pending queue and transient runtime state before reinstall?" "y"
-    if [ "$should_clear_runtime_state" -eq 1 ]; then
-      clear_runtime_state
-    fi
   fi
 
   build_hook_commands
   interactive_prompts
+  if [ "$HAS_EXISTING_INSTALL" -eq 1 ]; then
+    stop_existing_service
+    if [ "$should_clear_runtime_state" -eq 1 ]; then
+      clear_runtime_state
+    fi
+  fi
   create_state_dirs
   download_scripts
   write_credentials_json
