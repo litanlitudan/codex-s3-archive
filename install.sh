@@ -32,6 +32,7 @@ EXISTING_AWS_REGION=""
 EXISTING_R2_ACCOUNT_ID=""
 EXISTING_ACCESS_KEY_ID=""
 EXISTING_SECRET_ACCESS_KEY=""
+HAS_EXISTING_INSTALL=0
 
 CLI_USER_ID=0
 CLI_PROVIDER=0
@@ -195,6 +196,39 @@ ensure_tty() {
   fi
 }
 
+prompt_yes_no() {
+  local var_name="$1"
+  local prompt_label="$2"
+  local default_answer="${3:-y}"
+
+  ensure_tty
+
+  local suffix="[y/N]"
+  case "$default_answer" in
+    y|Y)
+      suffix="[Y/n]"
+      ;;
+  esac
+
+  local reply=""
+  while :; do
+    IFS= read -r -p "$prompt_label $suffix: " reply </dev/tty || true
+    if [ -z "$reply" ]; then
+      reply="$default_answer"
+    fi
+    case "$reply" in
+      y|Y|yes|YES)
+        printf -v "$var_name" '%s' "1"
+        return 0
+        ;;
+      n|N|no|NO)
+        printf -v "$var_name" '%s' "0"
+        return 0
+        ;;
+    esac
+  done
+}
+
 prompt_value() {
   local var_name="$1"
   local prompt_label="$2"
@@ -239,6 +273,8 @@ load_existing_install_state() {
   if [ ! -f "$config_path" ] && [ ! -f "$credentials_path" ]; then
     return 0
   fi
+
+  HAS_EXISTING_INSTALL=1
 
   local existing_output=""
   existing_output="$("${PYTHON3_PATH}" -c '
@@ -308,6 +344,17 @@ for key in (
   EXISTING_R2_ACCOUNT_ID="${lines[5]:-}"
   EXISTING_ACCESS_KEY_ID="${lines[6]:-}"
   EXISTING_SECRET_ACCESS_KEY="${lines[7]:-}"
+}
+
+clear_runtime_state() {
+  local target_root="${1:-$STATE_ROOT}"
+  rm -f \
+    "${target_root}/heartbeat.json" \
+    "${target_root}/daemon.pid" \
+    "${target_root}/daemon-supervisor.pid"
+  rm -f "${target_root}/staging"/* 2>/dev/null || true
+  rm -f "${target_root}/queue"/*.json 2>/dev/null || true
+  rm -f "${target_root}/queue/dead"/*.json 2>/dev/null || true
 }
 
 interactive_prompts() {
@@ -976,6 +1023,14 @@ main() {
   [ "$CLI_R2_ACCOUNT_ID" -eq 1 ] || R2_ACCOUNT_ID=""
   [ "$CLI_ACCESS_KEY_ID" -eq 1 ] || ACCESS_KEY_ID=""
   [ "$CLI_SECRET_ACCESS_KEY" -eq 1 ] || SECRET_ACCESS_KEY=""
+
+  if [ "$HAS_EXISTING_INSTALL" -eq 1 ]; then
+    local should_clear_runtime_state=0
+    prompt_yes_no should_clear_runtime_state "Existing install detected. Clear pending queue and transient runtime state before reinstall?" "y"
+    if [ "$should_clear_runtime_state" -eq 1 ]; then
+      clear_runtime_state
+    fi
+  fi
 
   build_hook_commands
   interactive_prompts
