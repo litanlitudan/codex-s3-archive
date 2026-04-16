@@ -93,18 +93,77 @@ nohup_supervisor_pid_path() {
   printf '%s\n' "${STATE_ROOT}/daemon-supervisor.pid"
 }
 
+daemon_pid_path() {
+  printf '%s\n' "${STATE_ROOT}/daemon.pid"
+}
+
+daemon_process_matches() {
+  local pid="$1"
+  local command_line
+  command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [ -n "$command_line" ] || return 1
+  case "$command_line" in
+    *"${STATE_ROOT}/bin/codex-s3-archive-daemon"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+find_daemon_pid() {
+  local pid_path pid
+  pid_path="$(daemon_pid_path)"
+  if [ -f "$pid_path" ]; then
+    pid="$("${PYTHON3_PATH}" -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); data = json.loads(path.read_text(encoding="utf-8")); print(data.get("pid") or "")' "$pid_path" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1 && daemon_process_matches "$pid"; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+  fi
+
+  ps ax -o pid= -o command= 2>/dev/null | awk -v pat="${STATE_ROOT}/bin/codex-s3-archive-daemon" 'index($0, pat) > 0 {print $1; exit}'
+}
+
+wait_for_pid_exit() {
+  local pid="$1"
+  local attempts=0
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 20 ]; then
+      kill -9 "$pid" >/dev/null 2>&1 || true
+      break
+    fi
+    sleep 0.25
+  done
+}
+
+stop_nohup_daemon() {
+  local pid
+  pid="$(find_daemon_pid)"
+  if [ -n "$pid" ] && daemon_process_matches "$pid"; then
+    kill "$pid" >/dev/null 2>&1 || true
+    wait_for_pid_exit "$pid"
+  fi
+  rm -f "$(daemon_pid_path)"
+}
+
 stop_nohup_supervisor() {
   local pid_path pid
   pid_path="$(nohup_supervisor_pid_path)"
   if [ ! -f "$pid_path" ]; then
+    stop_nohup_daemon
     return 0
   fi
 
   pid="$(cat "$pid_path" 2>/dev/null || true)"
   if [ -n "$pid" ] && nohup_supervisor_pid_matches "$pid"; then
     kill "$pid" >/dev/null 2>&1 || true
+    wait_for_pid_exit "$pid"
   fi
   rm -f "$pid_path"
+  stop_nohup_daemon
 }
 
 nohup_supervisor_pid_matches() {

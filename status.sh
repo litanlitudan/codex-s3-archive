@@ -64,10 +64,16 @@ service_state() {
       echo "running"
     elif nohup_supervisor_is_running; then
       echo "running"
+    elif daemon_is_running; then
+      echo "running"
     else
       echo "stopped"
     fi
   fi
+}
+
+daemon_pid_path() {
+  printf '%s\n' "${STATE_ROOT}/daemon.pid"
 }
 
 nohup_supervisor_is_running() {
@@ -85,6 +91,29 @@ nohup_supervisor_is_running() {
   kill -0 "$pid" >/dev/null 2>&1 && nohup_supervisor_pid_matches "$pid"
 }
 
+daemon_is_running() {
+  local pid
+  pid="$(find_daemon_pid)"
+  if [ -z "$pid" ]; then
+    return 1
+  fi
+  kill -0 "$pid" >/dev/null 2>&1 && daemon_process_matches "$pid"
+}
+
+find_daemon_pid() {
+  local pid_path pid
+  pid_path="$(daemon_pid_path)"
+  if [ -f "$pid_path" ]; then
+    pid="$("${PYTHON3_PATH}" -c 'import json, pathlib, sys; path = pathlib.Path(sys.argv[1]); data = json.loads(path.read_text(encoding="utf-8")); print(data.get("pid") or "")' "$pid_path" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1 && daemon_process_matches "$pid"; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+  fi
+
+  ps ax -o pid= -o command= 2>/dev/null | awk -v pat="${STATE_ROOT}/bin/codex-s3-archive-daemon" 'index($0, pat) > 0 {print $1; exit}'
+}
+
 nohup_supervisor_pid_matches() {
   local pid="$1"
   local command_line
@@ -92,6 +121,21 @@ nohup_supervisor_pid_matches() {
   [ -n "$command_line" ] || return 1
   case "$command_line" in
     *"${STATE_ROOT}/bin/codex-s3-archive-supervisor.sh"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+daemon_process_matches() {
+  local pid="$1"
+  local command_line
+  command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [ -n "$command_line" ] || return 1
+  case "$command_line" in
+    *"${STATE_ROOT}/bin/codex-s3-archive-daemon"*)
       return 0
       ;;
     *)
