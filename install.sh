@@ -24,6 +24,23 @@ AWS_REGION=""
 R2_ACCOUNT_ID=""
 ACCESS_KEY_ID=""
 SECRET_ACCESS_KEY=""
+EXISTING_USER_ID=""
+EXISTING_PROVIDER=""
+EXISTING_BUCKET=""
+EXISTING_MACHINE_ID=""
+EXISTING_AWS_REGION=""
+EXISTING_R2_ACCOUNT_ID=""
+EXISTING_ACCESS_KEY_ID=""
+EXISTING_SECRET_ACCESS_KEY=""
+
+CLI_USER_ID=0
+CLI_PROVIDER=0
+CLI_BUCKET=0
+CLI_MACHINE_ID=0
+CLI_AWS_REGION=0
+CLI_R2_ACCOUNT_ID=0
+CLI_ACCESS_KEY_ID=0
+CLI_SECRET_ACCESS_KEY=0
 
 HOOKS_BACKUP_PATH=""
 SMOKE_TEST_STATUS="not_run"
@@ -105,34 +122,42 @@ parse_cli_args() {
     case "$1" in
       --user-id)
         USER_ID="${2:-}"
+        CLI_USER_ID=1
         shift 2
         ;;
       --provider)
         PROVIDER="${2:-}"
+        CLI_PROVIDER=1
         shift 2
         ;;
       --bucket)
         BUCKET="${2:-}"
+        CLI_BUCKET=1
         shift 2
         ;;
       --machine-id)
         MACHINE_ID="${2:-}"
+        CLI_MACHINE_ID=1
         shift 2
         ;;
       --region)
         AWS_REGION="${2:-}"
+        CLI_AWS_REGION=1
         shift 2
         ;;
       --r2-account-id)
         R2_ACCOUNT_ID="${2:-}"
+        CLI_R2_ACCOUNT_ID=1
         shift 2
         ;;
       --access-key-id)
         ACCESS_KEY_ID="${2:-}"
+        CLI_ACCESS_KEY_ID=1
         shift 2
         ;;
       --secret-access-key)
         SECRET_ACCESS_KEY="${2:-}"
+        CLI_SECRET_ACCESS_KEY=1
         shift 2
         ;;
       --gist-base)
@@ -175,6 +200,7 @@ prompt_value() {
   local prompt_label="$2"
   local default_value="$3"
   local secret="${4:-0}"
+  local display_default="${5:-$default_value}"
   local current_value
   current_value="$(eval "printf '%s' \"\${$var_name:-}\"")"
   if [ -n "$current_value" ]; then
@@ -184,8 +210,8 @@ prompt_value() {
   ensure_tty
 
   local prompt_text="$prompt_label"
-  if [ -n "$default_value" ]; then
-    prompt_text="$prompt_text [$default_value]"
+  if [ -n "$display_default" ]; then
+    prompt_text="$prompt_text [$display_default]"
   fi
   prompt_text="$prompt_text: "
 
@@ -207,12 +233,89 @@ prompt_value() {
   done
 }
 
+load_existing_install_state() {
+  local config_path="${STATE_ROOT}/config.json"
+  local credentials_path="${STATE_ROOT}/credentials.json"
+  if [ ! -f "$config_path" ] && [ ! -f "$credentials_path" ]; then
+    return 0
+  fi
+
+  local existing_output=""
+  existing_output="$("${PYTHON3_PATH}" -c '
+import json
+import pathlib
+import sys
+from urllib.parse import urlparse
+
+state_root = pathlib.Path(sys.argv[1])
+config_path = state_root / "config.json"
+creds_path = state_root / "credentials.json"
+
+values = {
+    "user_id": "",
+    "provider": "",
+    "bucket": "",
+    "machine_id": "",
+    "aws_region": "",
+    "r2_account_id": "",
+    "access_key_id": "",
+    "secret_access_key": "",
+}
+
+try:
+    if config_path.exists():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        values["user_id"] = str(config.get("user_id") or "")
+        values["provider"] = str(config.get("provider") or "")
+        values["bucket"] = str(config.get("bucket") or "")
+        values["machine_id"] = str(config.get("machine_id") or "")
+        values["aws_region"] = str(config.get("region") or "")
+        endpoint = str(config.get("endpoint_url") or "")
+        if endpoint:
+            hostname = urlparse(endpoint).hostname or ""
+            if hostname.endswith(".r2.cloudflarestorage.com"):
+                values["r2_account_id"] = hostname[: -len(".r2.cloudflarestorage.com")]
+    if creds_path.exists():
+        creds = json.loads(creds_path.read_text(encoding="utf-8"))
+        values["access_key_id"] = str(creds.get("aws_access_key_id") or "")
+        values["secret_access_key"] = str(creds.get("aws_secret_access_key") or "")
+except Exception:
+    pass
+
+for key in (
+    "user_id",
+    "provider",
+    "bucket",
+    "machine_id",
+    "aws_region",
+    "r2_account_id",
+    "access_key_id",
+    "secret_access_key",
+):
+    print(values[key])
+' "$STATE_ROOT")"
+
+  local lines=()
+  while IFS= read -r line; do
+    lines+=("$line")
+  done <<<"$existing_output"
+
+  EXISTING_USER_ID="${lines[0]:-}"
+  EXISTING_PROVIDER="${lines[1]:-}"
+  EXISTING_BUCKET="${lines[2]:-}"
+  EXISTING_MACHINE_ID="${lines[3]:-}"
+  EXISTING_AWS_REGION="${lines[4]:-}"
+  EXISTING_R2_ACCOUNT_ID="${lines[5]:-}"
+  EXISTING_ACCESS_KEY_ID="${lines[6]:-}"
+  EXISTING_SECRET_ACCESS_KEY="${lines[7]:-}"
+}
+
 interactive_prompts() {
   local hostname_short
   hostname_short="$(hostname -s 2>/dev/null || hostname)"
 
-  prompt_value USER_ID "User ID" ""
-  prompt_value PROVIDER "Storage Provider (aws or r2)" "r2"
+  prompt_value USER_ID "User ID" "${EXISTING_USER_ID}"
+  prompt_value PROVIDER "Storage Provider (aws or r2)" "${EXISTING_PROVIDER:-r2}"
 
   case "$PROVIDER" in
     aws|r2)
@@ -222,17 +325,19 @@ interactive_prompts() {
       ;;
   esac
 
-  prompt_value BUCKET "Bucket" "mach-zero-codex"
-  prompt_value MACHINE_ID "Machine ID" "$hostname_short"
+  prompt_value BUCKET "Bucket" "${EXISTING_BUCKET:-mach-zero-codex}"
+  prompt_value MACHINE_ID "Machine ID" "${EXISTING_MACHINE_ID:-$hostname_short}"
 
   if [ "$PROVIDER" = "aws" ]; then
-    prompt_value AWS_REGION "AWS Region" "us-west-2"
-    prompt_value ACCESS_KEY_ID "AWS Access Key ID" ""
-    prompt_value SECRET_ACCESS_KEY "AWS Secret Access Key" "" 1
+    prompt_value AWS_REGION "AWS Region" "${EXISTING_AWS_REGION:-us-west-2}"
+    prompt_value ACCESS_KEY_ID "AWS Access Key ID" "${EXISTING_ACCESS_KEY_ID}"
+    prompt_value SECRET_ACCESS_KEY "AWS Secret Access Key" "${EXISTING_SECRET_ACCESS_KEY}" 1 "${EXISTING_SECRET_ACCESS_KEY:+saved}"
+    R2_ACCOUNT_ID=""
   else
-    prompt_value R2_ACCOUNT_ID "R2 Account ID" ""
-    prompt_value ACCESS_KEY_ID "R2 Access Key ID" ""
-    prompt_value SECRET_ACCESS_KEY "R2 Secret Access Key" "" 1
+    prompt_value R2_ACCOUNT_ID "R2 Account ID" "${EXISTING_R2_ACCOUNT_ID}"
+    prompt_value ACCESS_KEY_ID "R2 Access Key ID" "${EXISTING_ACCESS_KEY_ID}"
+    prompt_value SECRET_ACCESS_KEY "R2 Secret Access Key" "${EXISTING_SECRET_ACCESS_KEY}" 1 "${EXISTING_SECRET_ACCESS_KEY:+saved}"
+    AWS_REGION=""
   fi
 }
 
@@ -861,6 +966,17 @@ main() {
   detect_uv
   detect_python
   parse_cli_args "$@"
+  load_existing_install_state
+
+  [ "$CLI_USER_ID" -eq 1 ] || USER_ID=""
+  [ "$CLI_PROVIDER" -eq 1 ] || PROVIDER=""
+  [ "$CLI_BUCKET" -eq 1 ] || BUCKET=""
+  [ "$CLI_MACHINE_ID" -eq 1 ] || MACHINE_ID=""
+  [ "$CLI_AWS_REGION" -eq 1 ] || AWS_REGION=""
+  [ "$CLI_R2_ACCOUNT_ID" -eq 1 ] || R2_ACCOUNT_ID=""
+  [ "$CLI_ACCESS_KEY_ID" -eq 1 ] || ACCESS_KEY_ID=""
+  [ "$CLI_SECRET_ACCESS_KEY" -eq 1 ] || SECRET_ACCESS_KEY=""
+
   build_hook_commands
   interactive_prompts
   create_state_dirs
