@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 STATE_ROOT="${HOME}/.codex/s3-archive"
 HOOKS_JSON="${HOME}/.codex/hooks.json"
+CODEX_CONFIG_TOML="${HOME}/.codex/config.toml"
 PLIST_PATH="${HOME}/Library/LaunchAgents/com.codex.s3-archive.plist"
 SYSTEMD_UNIT_PATH="${HOME}/.config/systemd/user/codex-s3-archive.service"
 SERVICE_LABEL="com.codex.s3-archive"
@@ -46,6 +47,7 @@ CLI_SECRET_ACCESS_KEY=0
 HOOKS_BACKUP_PATH=""
 SMOKE_TEST_STATUS="not_run"
 SERVICE_SUMMARY="unknown"
+CODEX_CONFIG_SUMMARY="unknown"
 SMOKE_STARTUP_TIMEOUT_SECS=60
 
 ARCHIVE_HOOK_COMMAND=""
@@ -489,6 +491,83 @@ backup_hooks_json() {
     HOOKS_BACKUP_PATH="${HOME}/.codex/hooks.json.bak.${timestamp}"
     cp "$HOOKS_JSON" "$HOOKS_BACKUP_PATH"
   fi
+}
+
+ensure_codex_features_config() {
+  mkdir -p "${HOME}/.codex"
+
+  CODEX_CONFIG_SUMMARY="$("${PYTHON3_PATH}" -c '
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+
+header_re = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+setting_re = re.compile(r"^(\s*)codex_hooks\s*=\s*(true|false)(\s*(?:#.*)?)$")
+
+if path.exists():
+    text = path.read_text(encoding="utf-8")
+else:
+    text = ""
+
+if not text.strip():
+    path.write_text("[features]\ncodex_hooks = true\n", encoding="utf-8")
+    print("created")
+    raise SystemExit(0)
+
+lines = text.splitlines(keepends=True)
+features_start = None
+features_end = len(lines)
+
+for index, line in enumerate(lines):
+    match = header_re.match(line)
+    if not match:
+        continue
+    if match.group(1).strip() == "features":
+        features_start = index
+        break
+
+if features_start is None:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if text.strip():
+        text += "\n"
+    text += "[features]\ncodex_hooks = true\n"
+    path.write_text(text, encoding="utf-8")
+    print("updated")
+    raise SystemExit(0)
+
+for index in range(features_start + 1, len(lines)):
+    if header_re.match(lines[index]):
+        features_end = index
+        break
+
+for index in range(features_start + 1, features_end):
+    match = setting_re.match(lines[index])
+    if not match:
+        continue
+    if match.group(2) == "true":
+        print("already_configured")
+        raise SystemExit(0)
+    lines[index] = f"{match.group(1)}codex_hooks = true{match.group(3)}\n"
+    path.write_text("".join(lines), encoding="utf-8")
+    print("updated")
+    raise SystemExit(0)
+
+lines.insert(features_end, "codex_hooks = true\n")
+path.write_text("".join(lines), encoding="utf-8")
+print("updated")
+' "$CODEX_CONFIG_TOML")"
+
+  case "$CODEX_CONFIG_SUMMARY" in
+    created)
+      echo "Configured ${CODEX_CONFIG_TOML} with codex_hooks = true"
+      ;;
+    updated)
+      echo "Updated ${CODEX_CONFIG_TOML} to set codex_hooks = true"
+      ;;
+  esac
 }
 
 merge_hooks_json() {
@@ -1057,6 +1136,7 @@ OK Codex S3 Archive installed
   Provider:    ${PROVIDER}
   Bucket:      ${BUCKET}
   User ID:     ${USER_ID}
+  Codex config: ${CODEX_CONFIG_SUMMARY}
   Service:     ${SERVICE_SUMMARY}
   Smoke test:  ${SMOKE_TEST_STATUS}
 EOF
@@ -1096,6 +1176,7 @@ main() {
   download_scripts
   write_credentials_json
   write_config_json
+  ensure_codex_features_config
   merge_hooks_json
   warmup_daemon_runtime
   install_service
