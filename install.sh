@@ -46,6 +46,7 @@ CLI_SECRET_ACCESS_KEY=0
 HOOKS_BACKUP_PATH=""
 SMOKE_TEST_STATUS="not_run"
 SERVICE_SUMMARY="unknown"
+SMOKE_STARTUP_TIMEOUT_SECS=60
 
 ARCHIVE_HOOK_COMMAND=""
 WRAPPER_COMMAND=""
@@ -646,6 +647,13 @@ EOF
   fi
 }
 
+warmup_daemon_runtime() {
+  if ! "${UV_PATH}" run --script "${STATE_ROOT}/bin/codex-s3-archive-daemon" --state-root "${STATE_ROOT}" --config "${STATE_ROOT}/config.json" --once >>"${STATE_ROOT}/logs/daemon.stdout.log" 2>>"${STATE_ROOT}/logs/daemon.stderr.log"; then
+    print_smoke_diagnostics
+    fail "daemon runtime warmup failed"
+  fi
+}
+
 service_is_running() {
   if [ "$PLATFORM" = "Darwin" ]; then
     launchctl list "${SERVICE_LABEL}" >/dev/null 2>&1
@@ -936,18 +944,15 @@ print_smoke_diagnostics() {
 }
 
 smoke_test() {
-  sleep 3
-
   local age=""
-  local attempts=0
-  while [ "$attempts" -lt 10 ]; do
+  local deadline=$((SECONDS + SMOKE_STARTUP_TIMEOUT_SECS))
+  while [ "$SECONDS" -lt "$deadline" ]; do
     if service_is_running; then
       age="$(heartbeat_age_secs)"
       if [ "$age" -ge 0 ] && [ "$age" -le 30 ]; then
         break
       fi
     fi
-    attempts=$((attempts + 1))
     sleep 1
   done
 
@@ -1039,6 +1044,7 @@ main() {
   write_credentials_json
   write_config_json
   merge_hooks_json
+  warmup_daemon_runtime
   install_service
   smoke_test
   print_summary
