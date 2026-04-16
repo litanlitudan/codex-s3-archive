@@ -1,0 +1,76 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+import argparse
+import json
+import os
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def write_text_atomic(path: Path, content: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp.{uuid.uuid4().hex}")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def append_log(path: Path, line: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def build_job(payload: dict, *, created_at: str | None = None):
+    created_at = created_at or utc_now()
+    return {
+        "job_type": "codex_stop_archive",
+        "created_at": created_at,
+        "session_id": payload["session_id"],
+        "turn_id": payload.get("turn_id", "unknown-turn"),
+        "transcript_path": payload["transcript_path"],
+        "cwd": payload.get("cwd"),
+        "model": payload.get("model"),
+        "hook_event_name": payload.get("hook_event_name"),
+        "retry_count": 0,
+        "_stall_count": 0,
+    }
+
+
+def enqueue_job(state_root: Path, payload: dict, *, created_at: str | None = None):
+    state_root = Path(state_root)
+    job = build_job(payload, created_at=created_at)
+    filename = f"{job['created_at'].replace(':', '-')}__session_{job['session_id']}__turn_{job['turn_id']}.json"
+    queue_path = state_root / "queue" / filename
+    write_text_atomic(queue_path, json.dumps(job, ensure_ascii=True))
+    return queue_path
+
+
+def main(argv=None, *, stdin_text: str | None = None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--state-root", required=True)
+    args = parser.parse_args(argv)
+
+    state_root = Path(args.state_root)
+    log_path = state_root / "logs" / "hook-stop.log"
+
+    try:
+        raw_input = sys.stdin.read() if stdin_text is None else stdin_text
+        payload = json.loads(raw_input)
+        enqueue_job(state_root, payload)
+        return 0
+    except Exception as e:
+        append_log(log_path, f"{utc_now()} hook-stop-error {type(e).__name__}: {e}")
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

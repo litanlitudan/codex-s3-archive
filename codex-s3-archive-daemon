@@ -1,0 +1,487 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["boto3"]
+# ///
+import argparse
+import boto3
+import fcntl
+import hashlib
+import json
+import logging
+import os
+import random
+import socket
+import time
+import uuid
+import urllib3.exceptions
+from botocore.exceptions import ClientError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
+from datetime import datetime, timezone
+from pathlib import Path
+
+ORPHAN_TTL_SECONDS = 600
+MAX_STALL_COUNT = 5
+STALL_BACKOFF_BASE = 10
+MAX_S3_PUT_ATTEMPTS = 6
+S3_RETRY_BASE_SECS = 2
+S3_RETRY_CAP_SECS = 60
+S3_NETWORK_RETRY_CAP_SECS = 300
+IDLE_SLEEP_SECONDS = 2
+LOOP_SLEEP_SECONDS = 0.2
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def load_json(path: Path, default):
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json_atomic(path: Path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp.{uuid.uuid4().hex}")
+    tmp.write_text(json.dumps(obj, ensure_ascii=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_bytes_atomic(path: Path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp.{uuid.uuid4().hex}")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def list_staging_bases(staging_dir: Path):
+    bases = set()
+    for path in staging_dir.iterdir():
+        if not path.is_file():
+            continue
+        if path.name.endswith(".jsonl"):
+            bases.add(path.name[: -len(".jsonl")])
+        elif path.name.endswith(".meta.json"):
+            bases.add(path.name[: -len(".meta.json")])
+        elif path.name.endswith(".ready"):
+            bases.add(path.name[: -len(".ready")])
+    return sorted(bases)
+
+
+def sweep_orphaned_staging(staging_dir: Path, ttl_seconds: int = ORPHAN_TTL_SECONDS):
+    if not staging_dir.exists():
+        return
+
+    now = time.time()
+    for base_name in list_staging_bases(staging_dir):
+        base = staging_dir / base_name
+        data_path = base.with_suffix(".jsonl")
+        meta_path = base.with_suffix(".meta.json")
+        ready_path = base.with_suffix(".ready")
+        existing = [p for p in (data_path, meta_path, ready_path) if p.exists()]
+        if not existing:
+            continue
+        if ready_path.exists() and data_path.exists() and meta_path.exists():
+            continue
+
+        newest_mtime = max(p.stat().st_mtime for p in existing)
+        if ready_path.exists() or now - newest_mtime >= ttl_seconds:
+            logging.warning("archive_orphaned_staging: removing incomplete set %s", base_name)
+            for path in existing:
+                path.unlink(missing_ok=True)
+
+
+def checkpoint_path(state_root: Path, session_id: str, transcript_path: str):
+    digest = hashlib.sha256(transcript_path.encode("utf-8")).hexdigest()
+    return state_root / "checkpoints" / session_id / f"{digest}.json"
+
+
+def read_incremental_bytes(transcript: Path, start_offset: int, max_bytes: int = 0):
+    with transcript.open("rb") as f:
+        f.seek(start_offset)
+        if max_bytes > 0:
+            data = f.read(max_bytes + 8192)
+        else:
+            data = f.read()
+    last_newline = data.rfind(b"\n")
+    if last_newline < 0:
+        return b"", start_offset
+    return data[: last_newline + 1], start_offset + last_newline + 1
+
+
+def build_s3_key(job: dict, start: int, end: int, partition_date: str, config: dict, tp_hash: str) -> str:
+    return (
+        f"{config['prefix']}/"
+        f"{partition_date}/"
+        f"{config['user_id']}/"
+        f"{job['session_id']}/"
+        f"{tp_hash[:8]}/"
+        f"{start}-{end}.jsonl"
+    )
+
+
+def create_s3_client(config: dict, state_root: Path):
+    creds = load_json(state_root / "credentials.json", {})
+    session = boto3.Session(
+        aws_access_key_id=creds["aws_access_key_id"],
+        aws_secret_access_key=creds["aws_secret_access_key"],
+        region_name=config.get("region_name", config.get("region", "us-west-2")),
+    )
+    kwargs = {}
+    if config.get("endpoint_url"):
+        kwargs["endpoint_url"] = config["endpoint_url"]
+    return session.client("s3", **kwargs)
+
+
+def build_s3_metadata(raw_bytes: bytes, job: dict, config: dict):
+    return {
+        "triggering-turn-id": job.get("turn_id", ""),
+        "machine-id": config.get("machine_id", ""),
+        "raw-sha256": hashlib.sha256(raw_bytes).hexdigest(),
+    }
+
+
+def extract_http_status(exc: ClientError):
+    response = getattr(exc, "response", {}) or {}
+    metadata = response.get("ResponseMetadata", {}) or {}
+    status = metadata.get("HTTPStatusCode")
+    if status is not None:
+        return status
+    code = (response.get("Error", {}) or {}).get("Code")
+    if isinstance(code, str) and code.isdigit():
+        return int(code)
+    return None
+
+
+def is_retryable_server_status(status: int | None):
+    return status in (408, 429) or (status is not None and 500 <= status < 600)
+
+
+def is_network_error(exc: Exception):
+    # Intentionally broad: mid-flight TCP resets and refused/broken connections
+    # should be treated the same as connect/DNS failures and retried.
+    return isinstance(
+        exc,
+        (
+            ConnectionError,
+            TimeoutError,
+            socket.gaierror,
+            EndpointConnectionError,
+            ConnectTimeoutError,
+            ReadTimeoutError,
+            urllib3.exceptions.HTTPError,
+        ),
+    )
+
+
+def compute_backoff(attempt: int, *, cap: int, jitter_fn=None):
+    jitter_fn = jitter_fn or random.uniform
+    base_delay = min(cap, S3_RETRY_BASE_SECS * (2 ** (attempt - 1)))
+    return base_delay + jitter_fn(0, 1)
+
+
+def put_chunk_to_s3(
+    raw_bytes: bytes,
+    job: dict,
+    start: int,
+    end: int,
+    partition_date: str,
+    config: dict,
+    tp_hash: str,
+    s3=None,
+    *,
+    sleep_fn=time.sleep,
+    jitter_fn=None,
+):
+    s3_key = build_s3_key(job, start, end, partition_date, config, tp_hash)
+    metadata = build_s3_metadata(raw_bytes, job, config)
+    if s3 is None:
+        return s3_key
+
+    server_attempt = 0
+    network_attempt = 0
+
+    while True:
+        try:
+            s3.put_object(
+                Bucket=config["bucket"],
+                Key=s3_key,
+                Body=raw_bytes,
+                Metadata=metadata,
+            )
+            return s3_key
+        except ClientError as exc:
+            status = extract_http_status(exc)
+            if not is_retryable_server_status(status):
+                raise
+
+            server_attempt += 1
+            if server_attempt >= MAX_S3_PUT_ATTEMPTS:
+                raise
+
+            sleep_fn(compute_backoff(server_attempt, cap=S3_RETRY_CAP_SECS, jitter_fn=jitter_fn))
+        except Exception as exc:
+            if not is_network_error(exc):
+                raise
+
+            network_attempt += 1
+            sleep_fn(compute_backoff(network_attempt, cap=S3_NETWORK_RETRY_CAP_SECS, jitter_fn=jitter_fn))
+
+
+def ensure_state_dirs(state_root: Path):
+    for rel_path in ("queue", "queue/dead", "staging", "checkpoints", "logs"):
+        (state_root / rel_path).mkdir(parents=True, exist_ok=True)
+
+
+def process_next_job(state_root: Path, config: dict, *, sleep_fn=time.sleep, now_fn=utc_now, s3=None, jitter_fn=None):
+    ensure_state_dirs(state_root)
+    queue_dir = state_root / "queue"
+    staging_dir = state_root / "staging"
+    heartbeat_path = state_root / "heartbeat.json"
+    previous_heartbeat = load_json(heartbeat_path, {})
+
+    jobs = sorted(queue_dir.glob("*.json"))
+    if not jobs:
+        write_json_atomic(
+            heartbeat_path,
+            {
+                "last_cycle_at": now_fn(),
+                "queue_len": 0,
+                "last_success_s3_key": previous_heartbeat.get("last_success_s3_key"),
+                "last_error": previous_heartbeat.get("last_error"),
+            },
+        )
+        sleep_fn(IDLE_SLEEP_SECONDS)
+        return {"status": "idle", "loop_sleep": None}
+
+    job_path = jobs[0]
+    job = load_json(job_path, None)
+    if not job:
+        job_path.unlink(missing_ok=True)
+        return {"status": "discarded_invalid", "loop_sleep": None}
+
+    cp_path = checkpoint_path(state_root, job["session_id"], job["transcript_path"])
+    cp_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = cp_path.with_suffix(".lock")
+
+    with lock_path.open("a+") as lockf:
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+
+        cp = load_json(
+            cp_path,
+            {
+                "session_id": job["session_id"],
+                "transcript_path": job["transcript_path"],
+                "last_uploaded_byte_offset": 0,
+                "last_success_at": None,
+            },
+        )
+
+        transcript = Path(job["transcript_path"])
+        if not transcript.exists():
+            write_json_atomic(
+                heartbeat_path,
+                {
+                    "last_cycle_at": now_fn(),
+                    "queue_len": len(jobs),
+                    "last_success_s3_key": None,
+                    "last_error": "archive_abandoned: transcript_missing",
+                },
+            )
+            job_path.unlink(missing_ok=True)
+            return {"status": "missing_transcript", "job_path": job_path, "loop_sleep": None}
+
+        file_size = transcript.stat().st_size
+        if file_size < cp["last_uploaded_byte_offset"]:
+            logging.warning(
+                "archive_truncated: %s offset %d > file size %d, resetting checkpoint to 0",
+                job["session_id"],
+                cp["last_uploaded_byte_offset"],
+                file_size,
+            )
+            cp["last_uploaded_byte_offset"] = 0
+            write_json_atomic(cp_path, cp)
+            return {"status": "truncated_reset", "job_path": job_path, "checkpoint_path": cp_path, "loop_sleep": None}
+
+        byte_start = cp["last_uploaded_byte_offset"]
+        tp_hash = hashlib.sha256(job["transcript_path"].encode("utf-8")).hexdigest()[:12]
+
+        pending_prefix = f"{job['session_id']}_{tp_hash}_{byte_start}_"
+        pending = sorted(p for p in staging_dir.glob(f"{pending_prefix}*.ready") if p.is_file())
+
+        if pending:
+            staging_ready = pending[0]
+            staged_meta = load_json(staging_ready.with_suffix(".meta.json"), {})
+            staged_bytes = staging_ready.with_suffix(".jsonl").read_bytes()
+        else:
+            raw_bytes, next_offset = read_incremental_bytes(
+                transcript,
+                byte_start,
+                config.get("max_raw_chunk_bytes", 1048576),
+            )
+            if not raw_bytes:
+                last_success_at = cp.get("last_success_at")
+                if last_success_at and last_success_at >= job["created_at"]:
+                    job_path.unlink(missing_ok=True)
+                    return {"status": "already_consumed", "job_path": job_path, "loop_sleep": None}
+
+                stall_count = job.get("_stall_count", 0) + 1
+                if stall_count >= MAX_STALL_COUNT:
+                    dead_dir = job_path.parent / "dead"
+                    dead_dir.mkdir(exist_ok=True)
+                    dead_path = dead_dir / job_path.name
+                    job_path.rename(dead_path)
+                    logging.warning(
+                        "archive_stalled: %s moved to dead-letter after %d empty reads",
+                        job.get("session_id"),
+                        stall_count,
+                    )
+                    return {"status": "dead_letter", "job_path": dead_path, "stall_count": stall_count, "loop_sleep": None}
+
+                job["_stall_count"] = stall_count
+                write_json_atomic(job_path, job)
+                sleep_fn(STALL_BACKOFF_BASE * stall_count)
+                return {"status": "stalled", "job_path": job_path, "stall_count": stall_count, "loop_sleep": None}
+
+            job["_stall_count"] = 0
+            write_json_atomic(job_path, job)
+
+            event_ts = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
+            partition_date = event_ts.date().isoformat()
+            staged_meta = {
+                "schema_version": 1,
+                "session_id": job["session_id"],
+                "transcript_path": job["transcript_path"],
+                "byte_start": byte_start,
+                "byte_end": next_offset,
+                "partition_date": partition_date,
+                "created_at": job["created_at"],
+            }
+            staged_bytes = raw_bytes
+
+            staging_base = staging_dir / f"{pending_prefix}{next_offset}"
+            write_bytes_atomic(staging_base.with_suffix(".jsonl"), staged_bytes)
+            write_json_atomic(staging_base.with_suffix(".meta.json"), staged_meta)
+            write_bytes_atomic(staging_base.with_suffix(".ready"), b"")
+
+        try:
+            s3_key = put_chunk_to_s3(
+                staged_bytes,
+                job,
+                staged_meta["byte_start"],
+                staged_meta["byte_end"],
+                staged_meta["partition_date"],
+                config,
+                tp_hash,
+                s3=s3,
+                sleep_fn=sleep_fn,
+                jitter_fn=jitter_fn,
+            )
+        except Exception as exc:
+            dead_dir = job_path.parent / "dead"
+            dead_dir.mkdir(exist_ok=True)
+            dead_path = dead_dir / job_path.name
+            job_path.rename(dead_path)
+            logging.exception(
+                "archive_upload_failed: session_id=%s transcript_path=%s",
+                job.get("session_id"),
+                job.get("transcript_path"),
+            )
+            write_json_atomic(
+                heartbeat_path,
+                {
+                    "last_cycle_at": now_fn(),
+                    "queue_len": max(0, len(jobs) - 1),
+                    "last_success_s3_key": None,
+                    "last_error": f"archive_upload_failed: {type(exc).__name__}: {exc}",
+                },
+            )
+            return {
+                "status": "upload_failed",
+                "job_path": dead_path,
+                "error": str(exc),
+                "loop_sleep": None,
+            }
+
+        cp["last_uploaded_byte_offset"] = staged_meta["byte_end"]
+        cp["last_success_at"] = now_fn()
+        write_json_atomic(cp_path, cp)
+
+        cleanup_base = staging_dir / f"{pending_prefix}{staged_meta['byte_end']}"
+        for suffix in (".jsonl", ".meta.json", ".ready"):
+            cleanup_base.with_suffix(suffix).unlink(missing_ok=True)
+
+        job_path.unlink(missing_ok=True)
+        write_json_atomic(
+            heartbeat_path,
+            {
+                "last_cycle_at": now_fn(),
+                "queue_len": max(0, len(jobs) - 1),
+                "last_success_s3_key": s3_key,
+                "last_error": None,
+            },
+        )
+        return {
+            "status": "uploaded",
+            "s3_key": s3_key,
+            "job_path": job_path,
+            "checkpoint_path": cp_path,
+            "loop_sleep": LOOP_SLEEP_SECONDS,
+        }
+
+
+def run_daemon(state_root: Path, config: dict, *, sleep_fn=time.sleep, now_fn=utc_now, s3=None, jitter_fn=None, once: bool = False):
+    state_root = Path(state_root)
+    ensure_state_dirs(state_root)
+    daemon_lock_path = state_root / "daemon.lock"
+
+    with daemon_lock_path.open("a+") as daemon_lockf:
+        try:
+            fcntl.flock(daemon_lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logging.error("another daemon instance is already running")
+            return 1
+
+        s3_client = s3 if s3 is not None else create_s3_client(config, state_root)
+        sweep_orphaned_staging(state_root / "staging", ttl_seconds=ORPHAN_TTL_SECONDS)
+
+        if once:
+            result = process_next_job(
+                state_root,
+                config,
+                sleep_fn=sleep_fn,
+                now_fn=now_fn,
+                s3=s3_client,
+                jitter_fn=jitter_fn,
+            )
+            if result.get("loop_sleep"):
+                sleep_fn(result["loop_sleep"])
+            return result
+
+        while True:
+            result = process_next_job(
+                state_root,
+                config,
+                sleep_fn=sleep_fn,
+                now_fn=now_fn,
+                s3=s3_client,
+                jitter_fn=jitter_fn,
+            )
+            if result.get("loop_sleep"):
+                sleep_fn(result["loop_sleep"])
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--state-root", required=True)
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args(argv)
+
+    config = load_json(Path(args.config), {})
+    return run_daemon(Path(args.state_root), config)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
