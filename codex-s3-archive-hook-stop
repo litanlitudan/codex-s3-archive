@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --script
+#!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
 # dependencies = []
@@ -36,7 +36,7 @@ def require_text_field(payload: dict, field_name: str):
     return value
 
 
-def build_job(payload: dict, *, created_at: str | None = None):
+def build_job(payload: dict, *, created_at=None):
     created_at = created_at or utc_now()
     return {
         "job_type": "codex_stop_archive",
@@ -52,7 +52,7 @@ def build_job(payload: dict, *, created_at: str | None = None):
     }
 
 
-def enqueue_job(state_root: Path, payload: dict, *, created_at: str | None = None):
+def enqueue_job(state_root: Path, payload: dict, *, created_at=None):
     state_root = Path(state_root)
     job = build_job(payload, created_at=created_at)
     filename = f"{job['created_at'].replace(':', '-')}__session_{job['session_id']}__turn_{job['turn_id']}.json"
@@ -61,7 +61,7 @@ def enqueue_job(state_root: Path, payload: dict, *, created_at: str | None = Non
     return queue_path
 
 
-def main(argv=None, *, stdin_text: str | None = None):
+def main(argv=None, *, stdin_text=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-root", required=True)
     args = parser.parse_args(argv)

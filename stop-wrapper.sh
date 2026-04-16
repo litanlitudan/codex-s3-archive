@@ -2,6 +2,8 @@
 set -euo pipefail
 
 STATE_ROOT="${HOME}/.codex/s3-archive"
+HOOK_COMMAND="${STATE_ROOT}/bin/codex-s3-archive-hook-stop"
+LOG_PATH="${STATE_ROOT}/logs/hook-stop.log"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -22,20 +24,22 @@ EOF
   esac
 done
 
-if [ -x "${HOME}/.local/bin/uv" ]; then
-  UV_PATH="${HOME}/.local/bin/uv"
-else
-  UV_PATH="$(command -v uv 2>/dev/null || true)"
-fi
+append_log() {
+  mkdir -p "$(dirname "$LOG_PATH")"
+  printf '%s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" >>"$LOG_PATH"
+}
 
 PAYLOAD_FILE=$(mktemp "${TMPDIR:-/tmp}/codex-stop.XXXXXX")
 trap 'rm -f "$PAYLOAD_FILE"' EXIT
 cat >"$PAYLOAD_FILE"
 
 # Step 1: archive enqueue (fast, non-blocking)
-if [ -n "${UV_PATH}" ]; then
-  "${UV_PATH}" run --script "${STATE_ROOT}/bin/codex-s3-archive-hook-stop" \
-    --state-root "${STATE_ROOT}" <"$PAYLOAD_FILE" || true
+if [ -x "$HOOK_COMMAND" ]; then
+  if ! "$HOOK_COMMAND" --state-root "${STATE_ROOT}" <"$PAYLOAD_FILE"; then
+    append_log "hook-stop-error wrapper_exec_failed"
+  fi
+else
+  append_log "hook-stop-error wrapper_missing_hook_command"
 fi
 
 # Step 2: original Stop hook (if exists)

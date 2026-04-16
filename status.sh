@@ -81,16 +81,14 @@ daemon_pid_path() {
 nohup_supervisor_is_running() {
   local pid_path pid
   pid_path="${STATE_ROOT}/daemon-supervisor.pid"
-  if [ ! -f "$pid_path" ]; then
-    return 1
+  if [ -f "$pid_path" ]; then
+    pid="$(cat "$pid_path" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1 && nohup_supervisor_pid_matches "$pid"; then
+      return 0
+    fi
   fi
 
-  pid="$(cat "$pid_path" 2>/dev/null || true)"
-  if [ -z "$pid" ]; then
-    return 1
-  fi
-
-  kill -0 "$pid" >/dev/null 2>&1 && nohup_supervisor_pid_matches "$pid"
+  ps ax -o pid= -o command= 2>/dev/null | awk -v pat="${STATE_ROOT}/bin/codex-s3-archive-supervisor.sh" 'index($0, pat) > 0 {found=1; exit} END {exit(found ? 0 : 1)}'
 }
 
 daemon_is_running() {

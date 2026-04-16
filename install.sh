@@ -709,6 +709,10 @@ nohup_supervisor_pid_path() {
   printf '%s\n' "${STATE_ROOT}/daemon-supervisor.pid"
 }
 
+nohup_supervisor_lock_dir() {
+  printf '%s\n' "${STATE_ROOT}/daemon-supervisor.lock.d"
+}
+
 daemon_pid_path() {
   printf '%s\n' "${STATE_ROOT}/daemon.pid"
 }
@@ -771,16 +775,18 @@ wait_for_pid_exit() {
 nohup_supervisor_is_running() {
   local pid_path pid
   pid_path="$(nohup_supervisor_pid_path)"
-  if [ ! -f "$pid_path" ]; then
-    return 1
+  if [ -f "$pid_path" ]; then
+    pid="$(cat "$pid_path" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1 && nohup_supervisor_pid_matches "$pid"; then
+      return 0
+    fi
   fi
 
-  pid="$(cat "$pid_path" 2>/dev/null || true)"
-  if [ -z "$pid" ]; then
-    return 1
-  fi
+  find_nohup_supervisor_pid >/dev/null
+}
 
-  kill -0 "$pid" >/dev/null 2>&1 && nohup_supervisor_pid_matches "$pid"
+find_nohup_supervisor_pid() {
+  ps ax -o pid= -o command= 2>/dev/null | awk -v pat="${STATE_ROOT}/bin/codex-s3-archive-supervisor.sh" 'index($0, pat) > 0 {print $1; exit}'
 }
 
 nohup_supervisor_pid_matches() {
@@ -799,12 +805,34 @@ nohup_supervisor_pid_matches() {
 }
 
 write_nohup_supervisor() {
-  local supervisor_path
+  local supervisor_path pid_path lock_dir
   supervisor_path="$(nohup_supervisor_path)"
+  pid_path="$(nohup_supervisor_pid_path)"
+  lock_dir="$(nohup_supervisor_lock_dir)"
 
   cat >"$supervisor_path" <<EOF
 #!/bin/bash
 set -uo pipefail
+
+PID_PATH="${pid_path}"
+LOCK_DIR="${lock_dir}"
+LOG_PATH="${STATE_ROOT}/logs/daemon.stderr.log"
+
+cleanup() {
+  if [ -f "\$PID_PATH" ] && [ "\$(cat "\$PID_PATH" 2>/dev/null || true)" = "\$\$" ]; then
+    rm -f "\$PID_PATH"
+  fi
+  rmdir "\$LOCK_DIR" 2>/dev/null || true
+}
+
+trap cleanup EXIT INT TERM
+
+if ! mkdir "\$LOCK_DIR" 2>/dev/null; then
+  printf '%s WARN supervisor lock already held; exiting duplicate supervisor\n' "\$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >>"\$LOG_PATH"
+  exit 0
+fi
+
+printf '%s\n' "\$\$" >"\$PID_PATH"
 
 while true; do
   "${UV_PATH}" run --script "${STATE_ROOT}/bin/codex-s3-archive-daemon" --state-root "${STATE_ROOT}" --config "${STATE_ROOT}/config.json" >>"${STATE_ROOT}/logs/daemon.stdout.log" 2>>"${STATE_ROOT}/logs/daemon.stderr.log"
@@ -829,19 +857,29 @@ stop_nohup_daemon() {
 }
 
 stop_nohup_supervisor() {
-  local pid_path pid
+  local pid_path pid extra_pids
   pid_path="$(nohup_supervisor_pid_path)"
-  if [ ! -f "$pid_path" ]; then
-    stop_nohup_daemon
-    return 0
+  if [ -f "$pid_path" ]; then
+    pid="$(cat "$pid_path" 2>/dev/null || true)"
+    if [ -n "$pid" ] && nohup_supervisor_pid_matches "$pid"; then
+      kill "$pid" >/dev/null 2>&1 || true
+      wait_for_pid_exit "$pid"
+    fi
   fi
 
-  pid="$(cat "$pid_path" 2>/dev/null || true)"
-  if [ -n "$pid" ] && nohup_supervisor_pid_matches "$pid"; then
-    kill "$pid" >/dev/null 2>&1 || true
-    wait_for_pid_exit "$pid"
+  extra_pids="$(ps ax -o pid= -o command= 2>/dev/null | awk -v pat="${STATE_ROOT}/bin/codex-s3-archive-supervisor.sh" 'index($0, pat) > 0 {print $1}')"
+  if [ -n "$extra_pids" ]; then
+    for pid in $extra_pids; do
+      kill "$pid" >/dev/null 2>&1 || true
+    done
+    sleep 1
+    for pid in $extra_pids; do
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    done
   fi
+
   rm -f "$pid_path"
+  rmdir "$(nohup_supervisor_lock_dir)" 2>/dev/null || true
   stop_nohup_daemon
 }
 
@@ -859,14 +897,12 @@ stop_existing_service() {
 }
 
 install_nohup_supervisor() {
-  local pid_path supervisor_path
-  pid_path="$(nohup_supervisor_pid_path)"
+  local supervisor_path
   supervisor_path="$(nohup_supervisor_path)"
 
   stop_nohup_supervisor
   write_nohup_supervisor
   nohup "$supervisor_path" >/dev/null 2>&1 </dev/null &
-  printf '%s\n' "$!" >"$pid_path"
 
   if [ -n "$SYSTEMD_CHECK_ERROR" ]; then
     echo "WARN: systemd --user unavailable, using nohup fallback: ${SYSTEMD_CHECK_ERROR}" >&2
@@ -991,7 +1027,7 @@ smoke_test() {
 
   local payload
   payload="$("${PYTHON3_PATH}" -c 'import json, sys; print(json.dumps({"session_id": "smoke-test", "turn_id": "turn-smoke", "transcript_path": sys.argv[1], "cwd": sys.argv[2], "model": "smoke-test", "hook_event_name": "Stop"}))' "$smoke_transcript" "$PWD")"
-  printf '%s' "$payload" | "${UV_PATH}" run --script "${STATE_ROOT}/bin/codex-s3-archive-hook-stop" --state-root "${smoke_state_root}"
+  printf '%s' "$payload" | "${STATE_ROOT}/bin/codex-s3-archive-hook-stop" --state-root "${smoke_state_root}"
 
   if ! "${UV_PATH}" run --script "${STATE_ROOT}/bin/codex-s3-archive-daemon" --state-root "${smoke_state_root}" --config "${smoke_state_root}/config.json" --once; then
     print_smoke_diagnostics "$smoke_state_root"

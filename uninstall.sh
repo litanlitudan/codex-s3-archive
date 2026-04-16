@@ -93,6 +93,10 @@ nohup_supervisor_pid_path() {
   printf '%s\n' "${STATE_ROOT}/daemon-supervisor.pid"
 }
 
+nohup_supervisor_lock_dir() {
+  printf '%s\n' "${STATE_ROOT}/daemon-supervisor.lock.d"
+}
+
 daemon_pid_path() {
   printf '%s\n' "${STATE_ROOT}/daemon.pid"
 }
@@ -150,19 +154,29 @@ stop_nohup_daemon() {
 }
 
 stop_nohup_supervisor() {
-  local pid_path pid
+  local pid_path pid extra_pids
   pid_path="$(nohup_supervisor_pid_path)"
-  if [ ! -f "$pid_path" ]; then
-    stop_nohup_daemon
-    return 0
+  if [ -f "$pid_path" ]; then
+    pid="$(cat "$pid_path" 2>/dev/null || true)"
+    if [ -n "$pid" ] && nohup_supervisor_pid_matches "$pid"; then
+      kill "$pid" >/dev/null 2>&1 || true
+      wait_for_pid_exit "$pid"
+    fi
   fi
 
-  pid="$(cat "$pid_path" 2>/dev/null || true)"
-  if [ -n "$pid" ] && nohup_supervisor_pid_matches "$pid"; then
-    kill "$pid" >/dev/null 2>&1 || true
-    wait_for_pid_exit "$pid"
+  extra_pids="$(ps ax -o pid= -o command= 2>/dev/null | awk -v pat="${STATE_ROOT}/bin/codex-s3-archive-supervisor.sh" 'index($0, pat) > 0 {print $1}')"
+  if [ -n "$extra_pids" ]; then
+    for pid in $extra_pids; do
+      kill "$pid" >/dev/null 2>&1 || true
+    done
+    sleep 1
+    for pid in $extra_pids; do
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    done
   fi
+
   rm -f "$pid_path"
+  rmdir "$(nohup_supervisor_lock_dir)" 2>/dev/null || true
   stop_nohup_daemon
 }
 

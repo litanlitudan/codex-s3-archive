@@ -233,6 +233,30 @@ def test_hook_main_logs_and_skips_enqueue_when_transcript_path_missing(tmp_path,
     assert "transcript_path missing" in (state_root / "logs" / "hook-stop.log").read_text(encoding="utf-8")
 
 
+def test_hook_script_runs_without_uv_on_path(tmp_path):
+    payload = json.dumps(
+        {
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "transcript_path": str(tmp_path / "transcript.jsonl"),
+        }
+    )
+    result = subprocess.run(
+        [str(SCRIPT_DIR / "codex-s3-archive-hook-stop"), "--state-root", str(tmp_path)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env={
+            "HOME": str(Path.home()),
+            "PATH": "/usr/bin:/bin",
+        },
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert len(list((tmp_path / "queue").glob("*.json"))) == 1
+
+
 def test_read_incremental_bytes_from_offset_and_checkpoint_advances(tmp_path, daemon, hook):
     transcript = tmp_path / "transcript.jsonl"
     initial_bytes = b'{"a":1}\n{"b":2}\n'
@@ -478,9 +502,9 @@ def test_run_daemon_calls_startup_sweep_once(tmp_path, daemon, monkeypatch):
     assert calls == [(tmp_path / "staging", daemon.ORPHAN_TTL_SECONDS)]
 
 
-def test_empty_read_after_prior_success_deletes_job_without_stall(tmp_path, daemon, hook):
-    transcript = tmp_path / "partial-only.jsonl"
-    transcript.write_bytes(b'{"dangling":1')
+def test_empty_read_after_prior_success_deletes_job_without_stall_at_eof(tmp_path, daemon, hook):
+    transcript = tmp_path / "consumed.jsonl"
+    transcript.write_bytes(b"")
     config = make_config(tmp_path)
     job_path = enqueue_job(
         hook,
@@ -511,6 +535,40 @@ def test_empty_read_after_prior_success_deletes_job_without_stall(tmp_path, daem
     assert sleep_calls == []
     assert not job_path.exists()
     assert not (tmp_path / "queue" / "dead" / job_path.name).exists()
+
+
+def test_empty_read_after_prior_success_with_partial_tail_stalls(tmp_path, daemon, hook):
+    transcript = tmp_path / "partial-only.jsonl"
+    transcript.write_bytes(b'{"dangling":1')
+    config = make_config(tmp_path)
+    job_path = enqueue_job(
+        hook,
+        tmp_path,
+        transcript,
+        created_at="2026-04-16T00:00:01.000Z",
+    )
+    cp_path = daemon.checkpoint_path(tmp_path, "session-1", str(transcript))
+    daemon.write_json_atomic(
+        cp_path,
+        {
+            "session_id": "session-1",
+            "transcript_path": str(transcript),
+            "last_uploaded_byte_offset": 0,
+            "last_success_at": "2026-04-16T00:00:02.000Z",
+        },
+    )
+    sleep_calls = []
+
+    result = daemon.process_next_job(
+        tmp_path,
+        config,
+        sleep_fn=sleep_calls.append,
+        now_fn=lambda: "2026-04-16T00:00:03.000Z",
+    )
+
+    assert result["status"] == "stalled"
+    assert sleep_calls == [10]
+    assert job_path.exists()
 
 
 def test_process_next_job_dead_letters_invalid_job_without_crashing(tmp_path, daemon, caplog):
@@ -648,6 +706,47 @@ def test_process_next_job_uploads_to_s3_and_cleans_staging(tmp_path, daemon, hoo
         "machine-id": "m3",
         "raw-sha256": expected_hash,
     }
+
+
+def test_process_next_job_drains_large_transcript_across_multiple_cycles(tmp_path, daemon, hook):
+    transcript = tmp_path / "large-upload.jsonl"
+    data = b"".join(
+        '{{"line":{},"pad":"{}"}}\n'.format(i, "x" * 64).encode("utf-8")
+        for i in range(200)
+    )
+    transcript.write_bytes(data)
+    config = make_config(tmp_path, max_raw_chunk_bytes=4096)
+    fake_s3 = Mock()
+    job_path = enqueue_job(hook, tmp_path, transcript, created_at="2026-04-16T00:00:00.000Z")
+    cp_path = daemon.checkpoint_path(tmp_path, "session-1", str(transcript))
+
+    first = daemon.process_next_job(
+        tmp_path,
+        config,
+        sleep_fn=lambda _: None,
+        now_fn=lambda: "2026-04-16T00:00:01.000Z",
+        s3=fake_s3,
+    )
+
+    assert first["status"] == "uploaded"
+    assert job_path.exists()
+    assert read_json(cp_path)["last_uploaded_byte_offset"] < len(data)
+
+    for _ in range(10):
+        if not job_path.exists():
+            break
+        daemon.process_next_job(
+            tmp_path,
+            config,
+            sleep_fn=lambda _: None,
+            now_fn=lambda: "2026-04-16T00:00:02.000Z",
+            s3=fake_s3,
+        )
+
+    assert not job_path.exists()
+    assert read_json(cp_path)["last_uploaded_byte_offset"] == len(data)
+    assert b"".join(call.kwargs["Body"] for call in fake_s3.put_object.call_args_list) == data
+    assert len(fake_s3.put_object.call_args_list) > 1
 
 
 def test_idle_heartbeat_preserves_last_success_after_upload(tmp_path, daemon, hook):

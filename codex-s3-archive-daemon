@@ -472,7 +472,7 @@ def process_next_job(state_root: Path, config: dict, *, sleep_fn=time.sleep, now
             )
             if not raw_bytes:
                 last_success_at = cp.get("last_success_at")
-                if last_success_at and last_success_at >= job["created_at"]:
+                if last_success_at and last_success_at >= job["created_at"] and file_size == byte_start:
                     job_path.unlink(missing_ok=True)
                     return {"status": "already_consumed", "job_path": job_path, "loop_sleep": None}
 
@@ -554,12 +554,14 @@ def process_next_job(state_root: Path, config: dict, *, sleep_fn=time.sleep, now
         cleanup_base = staging_dir / f"{pending_prefix}{staged_meta['byte_end']}"
         cleanup_staging_base(cleanup_base)
 
-        job_path.unlink(missing_ok=True)
+        unread_bytes_remain = transcript.stat().st_size > cp["last_uploaded_byte_offset"]
+        if not unread_bytes_remain:
+            job_path.unlink(missing_ok=True)
         write_json_atomic(
             heartbeat_path,
             {
                 "last_cycle_at": now_fn(),
-                "queue_len": max(0, len(jobs) - 1),
+                "queue_len": len(jobs) if unread_bytes_remain else max(0, len(jobs) - 1),
                 "last_success_s3_key": s3_key,
                 "last_error": None,
             },
