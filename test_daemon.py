@@ -731,14 +731,33 @@ def test_process_next_job_dead_letters_after_exhausting_server_retries(tmp_path,
         now_fn=lambda: "2026-04-16T00:00:01.000Z",
         s3=fake_s3,
     )
-
-    dead_path = tmp_path / "queue" / "dead" / job_path.name
-    assert result["status"] == "upload_failed"
-    assert dead_path.exists()
-    assert not job_path.exists()
-    assert sleep_calls == [2.0, 4.0, 8.0, 16.0, 32.0]
+    assert result["status"] == "retry_scheduled"
+    assert result["retry_count"] == 1
+    assert job_path.exists()
+    assert sleep_calls == [2.0, 4.0, 8.0, 16.0, 32.0, 10]
     assert any(path.name.endswith(".ready") for path in (tmp_path / "staging").iterdir())
     assert "archive_upload_failed" in caplog.text
+
+    for expected_retry in range(2, daemon.MAX_RETRYABLE_JOB_ATTEMPTS + 1):
+        sleep_calls = []
+        result = daemon.process_next_job(
+            tmp_path,
+            config,
+            sleep_fn=sleep_calls.append,
+            now_fn=lambda: "2026-04-16T00:00:01.000Z",
+            s3=fake_s3,
+        )
+        if expected_retry < daemon.MAX_RETRYABLE_JOB_ATTEMPTS:
+            assert result["status"] == "retry_scheduled"
+            assert result["retry_count"] == expected_retry
+            assert sleep_calls[-1] == min(60, 10 * expected_retry)
+        else:
+            dead_path = tmp_path / "queue" / "dead" / job_path.name
+            assert result["status"] == "dead_letter"
+            assert result["retry_count"] == expected_retry
+            assert dead_path.exists()
+            assert not job_path.exists()
+            assert sleep_calls == []
 
 
 def test_put_chunk_to_s3_retries_network_errors_without_consuming_server_budget(tmp_path, daemon, monkeypatch):
@@ -808,6 +827,36 @@ def test_put_chunk_to_s3_caps_network_backoff(tmp_path, daemon, monkeypatch):
     assert sleep_calls[-1] == float(daemon.S3_NETWORK_RETRY_CAP_SECS)
 
 
+def test_put_chunk_to_s3_raises_after_exhausting_network_retries(tmp_path, daemon, monkeypatch):
+    job = {
+        "session_id": "session-1",
+        "turn_id": "turn-1",
+    }
+    config = make_config(tmp_path)
+    fake_s3 = Mock()
+    fake_s3.put_object.side_effect = [
+        EndpointConnectionError(endpoint_url="https://example.invalid")
+        for _ in range(daemon.MAX_S3_NETWORK_ATTEMPTS)
+    ]
+    sleep_calls = []
+    monkeypatch.setattr(daemon.random, "uniform", lambda a, b: 0.0)
+
+    with pytest.raises(EndpointConnectionError):
+        daemon.put_chunk_to_s3(
+            b'{"a":1}\n',
+            job,
+            0,
+            8,
+            "2026-04-16",
+            config,
+            "123456789abc",
+            s3=fake_s3,
+            sleep_fn=sleep_calls.append,
+        )
+
+    assert len(sleep_calls) == daemon.MAX_S3_NETWORK_ATTEMPTS - 1
+
+
 def test_process_next_job_dead_letters_on_non_retryable_403_and_preserves_staging(tmp_path, daemon, hook, monkeypatch, caplog):
     transcript = tmp_path / "forbidden.jsonl"
     transcript.write_bytes(b'{"alpha":1}\n')
@@ -826,11 +875,9 @@ def test_process_next_job_dead_letters_on_non_retryable_403_and_preserves_stagin
         now_fn=lambda: "2026-04-16T00:00:01.000Z",
         s3=fake_s3,
     )
-
-    dead_path = tmp_path / "queue" / "dead" / job_path.name
-    assert result["status"] == "upload_failed"
-    assert dead_path.exists()
-    assert sleep_calls == []
+    assert result["status"] == "retry_scheduled"
+    assert result["retry_count"] == 1
+    assert sleep_calls == [10]
     staging_names = sorted(path.name for path in (tmp_path / "staging").iterdir())
     assert any(name.endswith(".jsonl") for name in staging_names)
     assert any(name.endswith(".meta.json") for name in staging_names)
@@ -875,3 +922,70 @@ def test_main_once_maps_result_status_to_exit_code(tmp_path, daemon, monkeypatch
     exit_code = daemon.main(["--state-root", str(tmp_path), "--config", str(config_path), "--once"])
 
     assert exit_code == expected_exit_code
+
+
+def test_missing_transcript_is_retried_then_dead_lettered_after_ttl(tmp_path, daemon):
+    config = make_config(tmp_path)
+    queue_dir = tmp_path / "queue"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    job_path = queue_dir / "missing.json"
+    daemon.write_json_atomic(
+        job_path,
+        {
+            "job_type": "codex_stop_archive",
+            "created_at": "2026-04-16T00:00:00.000Z",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "transcript_path": str(tmp_path / "not-here.jsonl"),
+            "retry_count": 0,
+            "_stall_count": 0,
+        },
+    )
+
+    sleep_calls = []
+    first = daemon.process_next_job(
+        tmp_path,
+        config,
+        sleep_fn=sleep_calls.append,
+        now_fn=lambda: "2026-04-16T00:00:05.000Z",
+    )
+    assert first["status"] == "retry_scheduled"
+    assert first["retry_count"] == 1
+    assert sleep_calls == [10]
+    assert job_path.exists()
+
+    second = daemon.process_next_job(
+        tmp_path,
+        config,
+        sleep_fn=lambda _: None,
+        now_fn=lambda: "2026-04-16T00:10:01.000Z",
+    )
+    dead_path = tmp_path / "queue" / "dead" / job_path.name
+    assert second["status"] == "missing_transcript"
+    assert dead_path.exists()
+    assert not job_path.exists()
+
+
+def test_corrupt_staging_is_cleaned_and_chunk_is_rebuilt(tmp_path, daemon, hook, caplog):
+    transcript = tmp_path / "corrupt-staging.jsonl"
+    transcript.write_bytes(b'{"alpha":1}\n')
+    config = make_config(tmp_path)
+    enqueue_job(hook, tmp_path, transcript, created_at="2026-04-16T00:00:00.000Z")
+
+    staging_base = tmp_path / "staging" / f"session-1_{hashlib.sha256(str(transcript).encode('utf-8')).hexdigest()[:12]}_0_12"
+    daemon.write_bytes_atomic(staging_base.with_suffix(".jsonl"), b'{"alpha":1}\n')
+    daemon.write_json_atomic(staging_base.with_suffix(".meta.json"), {"byte_start": 99})
+    daemon.write_bytes_atomic(staging_base.with_suffix(".ready"), b"")
+
+    caplog.set_level("WARNING")
+    result = daemon.process_next_job(
+        tmp_path,
+        config,
+        sleep_fn=lambda _: None,
+        now_fn=lambda: "2026-04-16T00:00:01.000Z",
+        s3=Mock(),
+    )
+
+    assert result["status"] == "uploaded"
+    assert "archive_corrupt_staging" in caplog.text
+    assert list((tmp_path / "staging").iterdir()) == []
