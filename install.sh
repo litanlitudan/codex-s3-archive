@@ -14,7 +14,6 @@ SERVICE_NAME="codex-s3-archive"
 PLATFORM=""
 UV_PATH=""
 PYTHON3_PATH=""
-CODEX_PATH=""
 SYSTEMD_CHECK_ERROR=""
 
 USER_ID=""
@@ -99,10 +98,6 @@ detect_python() {
   if [ -z "$PYTHON3_PATH" ]; then
     fail "python3 not found"
   fi
-}
-
-detect_codex() {
-  CODEX_PATH="$(command -v codex 2>/dev/null || true)"
 }
 
 parse_cli_args() {
@@ -242,12 +237,13 @@ interactive_prompts() {
 }
 
 create_state_dirs() {
+  local target_root="${1:-$STATE_ROOT}"
   mkdir -p \
-    "${STATE_ROOT}/bin" \
-    "${STATE_ROOT}/queue/dead" \
-    "${STATE_ROOT}/staging" \
-    "${STATE_ROOT}/checkpoints" \
-    "${STATE_ROOT}/logs"
+    "${target_root}/bin" \
+    "${target_root}/queue/dead" \
+    "${target_root}/staging" \
+    "${target_root}/checkpoints" \
+    "${target_root}/logs"
 }
 
 download_scripts() {
@@ -279,6 +275,7 @@ download_or_copy_file() {
 }
 
 write_credentials_json() {
+  local target_root="${1:-$STATE_ROOT}"
   "${PYTHON3_PATH}" -c '
 import json
 import pathlib
@@ -290,11 +287,12 @@ payload = {
     "aws_secret_access_key": sys.argv[3],
 }
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-' "${STATE_ROOT}/credentials.json" "$ACCESS_KEY_ID" "$SECRET_ACCESS_KEY"
-  chmod 600 "${STATE_ROOT}/credentials.json"
+' "${target_root}/credentials.json" "$ACCESS_KEY_ID" "$SECRET_ACCESS_KEY"
+  chmod 600 "${target_root}/credentials.json"
 }
 
 write_config_json() {
+  local target_root="${1:-$STATE_ROOT}"
   local endpoint_url=""
   local region_name=""
   if [ "$PROVIDER" = "r2" ]; then
@@ -327,7 +325,7 @@ else:
     config["endpoint_url"] = endpoint_url
     config["region_name"] = region_name
 path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-' "${STATE_ROOT}/config.json" "$USER_ID" "$PROVIDER" "$BUCKET" "$MACHINE_ID" "$STATE_ROOT" "$AWS_REGION" "$endpoint_url" "$region_name"
+' "${target_root}/config.json" "$USER_ID" "$PROVIDER" "$BUCKET" "$MACHINE_ID" "$target_root" "$AWS_REGION" "$endpoint_url" "$region_name"
 }
 
 backup_hooks_json() {
@@ -420,67 +418,6 @@ for entry in stop_entries[1:]:
 
 hooks_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 ' "$HOOKS_JSON" "$STATE_ROOT" "$ARCHIVE_HOOK_COMMAND" "$WRAPPER_COMMAND" "$LEGACY_ARCHIVE_HOOK_COMMAND" "$LEGACY_WRAPPER_COMMAND"
-}
-
-codex_hooks_feature_state() {
-  if [ -z "$CODEX_PATH" ]; then
-    echo "unavailable"
-    return 0
-  fi
-
-  "${CODEX_PATH}" features list 2>/dev/null | awk '$1=="codex_hooks"{print $3; found=1} END {if (!found) print "unknown"}'
-}
-
-ensure_codex_hooks_feature_enabled() {
-  local feature_state
-  feature_state="$(codex_hooks_feature_state)"
-
-  case "$feature_state" in
-    true)
-      return 0
-      ;;
-    false)
-      if ! "${CODEX_PATH}" features enable codex_hooks >/dev/null 2>&1; then
-        echo "WARN: failed to enable codex_hooks via codex features enable codex_hooks" >&2
-        return 0
-      fi
-      ;;
-    unavailable)
-      echo "WARN: codex command not found; could not verify codex_hooks feature state" >&2
-      return 0
-      ;;
-    *)
-      echo "WARN: could not determine codex_hooks feature state (got: ${feature_state})" >&2
-      return 0
-      ;;
-  esac
-
-  feature_state="$(codex_hooks_feature_state)"
-  if [ "$feature_state" != "true" ]; then
-    echo "WARN: codex_hooks feature is still not enabled; live Stop hooks may not execute" >&2
-  fi
-}
-
-assert_codex_hooks_feature_enabled() {
-  local feature_state
-  feature_state="$(codex_hooks_feature_state)"
-
-  case "$feature_state" in
-    true)
-      return 0
-      ;;
-    false)
-      fail "codex_hooks feature is disabled; install would pass smoke test but live Codex Stop hooks will not fire"
-      ;;
-    unavailable)
-      echo "WARN: codex command not found; skipping codex_hooks feature verification" >&2
-      return 0
-      ;;
-    *)
-      echo "WARN: unable to verify codex_hooks feature state before smoke test (got: ${feature_state})" >&2
-      return 0
-      ;;
-  esac
 }
 
 install_service() {
@@ -788,26 +725,65 @@ except Exception:
 ' "${STATE_ROOT}/heartbeat.json"
 }
 
+print_signature_mismatch_hint() {
+  local diagnostics_root="${1:-$STATE_ROOT}"
+  local signature_detected=0
+  local log_file
+
+  if [ -f "${diagnostics_root}/heartbeat.json" ] && grep -q 'SignatureDoesNotMatch' "${diagnostics_root}/heartbeat.json" 2>/dev/null; then
+    signature_detected=1
+  fi
+
+  if [ "$signature_detected" -eq 0 ]; then
+    for log_file in "${diagnostics_root}/logs/daemon.stdout.log" "${diagnostics_root}/logs/daemon.stderr.log" "${diagnostics_root}/logs/hook-stop.log"; do
+      if [ -f "$log_file" ] && grep -q 'SignatureDoesNotMatch' "$log_file" 2>/dev/null; then
+        signature_detected=1
+        break
+      fi
+    done
+  fi
+
+  if [ "$signature_detected" -eq 0 ]; then
+    return 0
+  fi
+
+  echo "Likely storage signature mismatch:" >&2
+  if [ "$PROVIDER" = "r2" ]; then
+    cat <<EOF >&2
+- verify Access Key ID / Secret Access Key come from an R2 S3 API token
+- verify the R2 account ID matches the endpoint URL
+- verify the bucket belongs to the same Cloudflare account as the credentials
+EOF
+  else
+    cat <<EOF >&2
+- verify the access key ID / secret access key pair is correct
+- verify the configured region matches the bucket's region
+EOF
+  fi
+}
+
 print_smoke_diagnostics() {
+  local diagnostics_root="${1:-$STATE_ROOT}"
   echo "Smoke test diagnostics:" >&2
-  if [ -f "${STATE_ROOT}/heartbeat.json" ]; then
+  if [ -f "${diagnostics_root}/heartbeat.json" ]; then
     echo "--- heartbeat.json ---" >&2
-    cat "${STATE_ROOT}/heartbeat.json" >&2
+    cat "${diagnostics_root}/heartbeat.json" >&2
   else
     echo "heartbeat.json missing" >&2
   fi
 
   local log_file
-  for log_file in "${STATE_ROOT}/logs/daemon.stdout.log" "${STATE_ROOT}/logs/daemon.stderr.log" "${STATE_ROOT}/logs/hook-stop.log"; do
+  for log_file in "${diagnostics_root}/logs/daemon.stdout.log" "${diagnostics_root}/logs/daemon.stderr.log" "${diagnostics_root}/logs/hook-stop.log"; do
     if [ -f "$log_file" ]; then
       echo "--- tail ${log_file} ---" >&2
       tail -n 50 "$log_file" >&2 || true
     fi
   done
+
+  print_signature_mismatch_hint "$diagnostics_root"
 }
 
 smoke_test() {
-  assert_codex_hooks_feature_enabled
   sleep 3
 
   local age=""
@@ -834,38 +810,37 @@ smoke_test() {
     fail "heartbeat.json was not written recently"
   fi
 
-  local before_key=""
-  if [ -f "${STATE_ROOT}/heartbeat.json" ]; then
-    before_key="$("${PYTHON3_PATH}" -c 'import json, pathlib, sys; data=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print(data.get("last_success_s3_key") or "")' "${STATE_ROOT}/heartbeat.json")"
-  fi
+  local smoke_state_root
+  smoke_state_root="$(mktemp -d "${TMPDIR:-/tmp}/codex-s3-archive-smoke.XXXXXX")"
+  create_state_dirs "$smoke_state_root"
+  write_credentials_json "$smoke_state_root"
+  write_config_json "$smoke_state_root"
 
-  local smoke_transcript="${STATE_ROOT}/smoke-test-$(date +%s).jsonl"
+  local smoke_transcript="${smoke_state_root}/smoke-test-$(date +%s).jsonl"
   printf '{"smoke":true,"ts":"%s"}\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >"$smoke_transcript"
 
   local payload
   payload="$("${PYTHON3_PATH}" -c 'import json, sys; print(json.dumps({"session_id": "smoke-test", "turn_id": "turn-smoke", "transcript_path": sys.argv[1], "cwd": sys.argv[2], "model": "smoke-test", "hook_event_name": "Stop"}))' "$smoke_transcript" "$PWD")"
-  printf '%s' "$payload" | "${UV_PATH}" run --script "${STATE_ROOT}/bin/codex-s3-archive-hook-stop" --state-root "${STATE_ROOT}"
+  printf '%s' "$payload" | "${UV_PATH}" run --script "${STATE_ROOT}/bin/codex-s3-archive-hook-stop" --state-root "${smoke_state_root}"
 
-  attempts=0
-  local success_key=""
-  while [ "$attempts" -lt 10 ]; do
-    if [ -f "${STATE_ROOT}/heartbeat.json" ]; then
-      success_key="$("${PYTHON3_PATH}" -c 'import json, pathlib, sys; data=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print(data.get("last_success_s3_key") or "")' "${STATE_ROOT}/heartbeat.json")"
-      if [ -n "$success_key" ] && [ "$success_key" != "$before_key" ]; then
-        break
-      fi
-    fi
-    attempts=$((attempts + 1))
-    sleep 1
-  done
-
-  rm -f "$smoke_transcript"
-
-  if [ -z "$success_key" ] || [ "$success_key" = "$before_key" ]; then
-    print_smoke_diagnostics
+  if ! "${UV_PATH}" run --script "${STATE_ROOT}/bin/codex-s3-archive-daemon" --state-root "${smoke_state_root}" --config "${smoke_state_root}/config.json" --once; then
+    print_smoke_diagnostics "$smoke_state_root"
+    echo "Smoke test state preserved at: ${smoke_state_root}" >&2
     fail "smoke test upload did not succeed"
   fi
 
+  local success_key=""
+  if [ -f "${smoke_state_root}/heartbeat.json" ]; then
+    success_key="$("${PYTHON3_PATH}" -c 'import json, pathlib, sys; data=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); print(data.get("last_success_s3_key") or "")' "${smoke_state_root}/heartbeat.json")"
+  fi
+
+  if [ -z "$success_key" ]; then
+    print_smoke_diagnostics "$smoke_state_root"
+    echo "Smoke test state preserved at: ${smoke_state_root}" >&2
+    fail "smoke test upload did not succeed"
+  fi
+
+  rm -rf "$smoke_state_root"
   SMOKE_TEST_STATUS="passed"
 }
 
@@ -885,7 +860,6 @@ main() {
   detect_platform
   detect_uv
   detect_python
-  detect_codex
   parse_cli_args "$@"
   build_hook_commands
   interactive_prompts
@@ -894,7 +868,6 @@ main() {
   write_credentials_json
   write_config_json
   merge_hooks_json
-  ensure_codex_hooks_feature_enabled
   install_service
   smoke_test
   print_summary

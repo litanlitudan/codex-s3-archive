@@ -29,22 +29,11 @@ def append_log(path: Path, line: str):
         f.write(line + "\n")
 
 
-def write_real_stop_marker(state_root: Path, payload: dict, *, created_at: str):
-    if payload.get("session_id") == "smoke-test":
-        return
-
-    marker_path = state_root / "last-real-stop-hook.json"
-    marker = {
-        "seen_at": utc_now(),
-        "created_at": created_at,
-        "session_id": payload["session_id"],
-        "turn_id": payload.get("turn_id", "unknown-turn"),
-        "transcript_path": payload["transcript_path"],
-        "cwd": payload.get("cwd"),
-        "model": payload.get("model"),
-        "hook_event_name": payload.get("hook_event_name"),
-    }
-    write_text_atomic(marker_path, json.dumps(marker, ensure_ascii=True))
+def require_text_field(payload: dict, field_name: str):
+    value = payload.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} missing")
+    return value
 
 
 def build_job(payload: dict, *, created_at: str | None = None):
@@ -52,9 +41,9 @@ def build_job(payload: dict, *, created_at: str | None = None):
     return {
         "job_type": "codex_stop_archive",
         "created_at": created_at,
-        "session_id": payload["session_id"],
+        "session_id": require_text_field(payload, "session_id"),
         "turn_id": payload.get("turn_id", "unknown-turn"),
-        "transcript_path": payload["transcript_path"],
+        "transcript_path": require_text_field(payload, "transcript_path"),
         "cwd": payload.get("cwd"),
         "model": payload.get("model"),
         "hook_event_name": payload.get("hook_event_name"),
@@ -69,7 +58,7 @@ def enqueue_job(state_root: Path, payload: dict, *, created_at: str | None = Non
     filename = f"{job['created_at'].replace(':', '-')}__session_{job['session_id']}__turn_{job['turn_id']}.json"
     queue_path = state_root / "queue" / filename
     write_text_atomic(queue_path, json.dumps(job, ensure_ascii=True))
-    return queue_path, job
+    return queue_path
 
 
 def main(argv=None, *, stdin_text: str | None = None):
@@ -83,8 +72,7 @@ def main(argv=None, *, stdin_text: str | None = None):
     try:
         raw_input = sys.stdin.read() if stdin_text is None else stdin_text
         payload = json.loads(raw_input)
-        _, job = enqueue_job(state_root, payload)
-        write_real_stop_marker(state_root, payload, created_at=job["created_at"])
+        enqueue_job(state_root, payload)
         return 0
     except Exception as e:
         append_log(log_path, f"{utc_now()} hook-stop-error {type(e).__name__}: {e}")

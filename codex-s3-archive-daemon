@@ -251,6 +251,31 @@ def ensure_state_dirs(state_root: Path):
         (state_root / rel_path).mkdir(parents=True, exist_ok=True)
 
 
+def move_job_to_dead(job_path: Path):
+    dead_dir = job_path.parent / "dead"
+    dead_dir.mkdir(exist_ok=True)
+    dead_path = dead_dir / job_path.name
+    job_path.rename(dead_path)
+    return dead_path
+
+
+def validate_job(job):
+    if not isinstance(job, dict):
+        return "job payload must be an object"
+
+    for field_name in ("session_id", "transcript_path", "created_at"):
+        value = job.get(field_name)
+        if not isinstance(value, str) or not value:
+            return f"{field_name} missing"
+
+    try:
+        datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
+    except ValueError:
+        return "created_at invalid"
+
+    return None
+
+
 def process_next_job(state_root: Path, config: dict, *, sleep_fn=time.sleep, now_fn=utc_now, s3=None, jitter_fn=None):
     ensure_state_dirs(state_root)
     queue_dir = state_root / "queue"
@@ -277,6 +302,25 @@ def process_next_job(state_root: Path, config: dict, *, sleep_fn=time.sleep, now
     if not job:
         job_path.unlink(missing_ok=True)
         return {"status": "discarded_invalid", "loop_sleep": None}
+    invalid_reason = validate_job(job)
+    if invalid_reason:
+        dead_path = move_job_to_dead(job_path)
+        logging.warning("archive_invalid_job: %s reason=%s", dead_path.name, invalid_reason)
+        write_json_atomic(
+            heartbeat_path,
+            {
+                "last_cycle_at": now_fn(),
+                "queue_len": max(0, len(jobs) - 1),
+                "last_success_s3_key": previous_heartbeat.get("last_success_s3_key"),
+                "last_error": f"archive_invalid_job: {invalid_reason}",
+            },
+        )
+        return {
+            "status": "invalid_job",
+            "job_path": dead_path,
+            "error": invalid_reason,
+            "loop_sleep": None,
+        }
 
     cp_path = checkpoint_path(state_root, job["session_id"], job["transcript_path"])
     cp_path.parent.mkdir(parents=True, exist_ok=True)
@@ -345,10 +389,7 @@ def process_next_job(state_root: Path, config: dict, *, sleep_fn=time.sleep, now
 
                 stall_count = job.get("_stall_count", 0) + 1
                 if stall_count >= MAX_STALL_COUNT:
-                    dead_dir = job_path.parent / "dead"
-                    dead_dir.mkdir(exist_ok=True)
-                    dead_path = dead_dir / job_path.name
-                    job_path.rename(dead_path)
+                    dead_path = move_job_to_dead(job_path)
                     logging.warning(
                         "archive_stalled: %s moved to dead-letter after %d empty reads",
                         job.get("session_id"),
@@ -396,10 +437,7 @@ def process_next_job(state_root: Path, config: dict, *, sleep_fn=time.sleep, now
                 jitter_fn=jitter_fn,
             )
         except Exception as exc:
-            dead_dir = job_path.parent / "dead"
-            dead_dir.mkdir(exist_ok=True)
-            dead_path = dead_dir / job_path.name
-            job_path.rename(dead_path)
+            dead_path = move_job_to_dead(job_path)
             logging.exception(
                 "archive_upload_failed: session_id=%s transcript_path=%s",
                 job.get("session_id"),
@@ -497,10 +535,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-root", required=True)
     parser.add_argument("--config", required=True)
+    parser.add_argument("--once", action="store_true")
     args = parser.parse_args(argv)
 
     config = load_json(Path(args.config), {})
-    return run_daemon(Path(args.state_root), config)
+    result = run_daemon(Path(args.state_root), config, once=args.once)
+    if isinstance(result, dict):
+        return 0 if result.get("status") in {"idle", "uploaded", "already_consumed", "discarded_invalid", "truncated_reset", "stalled"} else 1
+    return result
 
 
 if __name__ == "__main__":

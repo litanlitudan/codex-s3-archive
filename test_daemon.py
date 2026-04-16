@@ -64,7 +64,7 @@ def write_credentials(state_root: Path, access_key="AKIA_TEST", secret_key="secr
 
 
 def enqueue_job(hook, state_root: Path, transcript: Path, *, session_id="session-1", turn_id="turn-1", created_at="2026-04-16T00:00:00.000Z"):
-    queue_path, _job = hook.enqueue_job(
+    return hook.enqueue_job(
         state_root,
         {
             "session_id": session_id,
@@ -76,7 +76,6 @@ def enqueue_job(hook, state_root: Path, transcript: Path, *, session_id="session
         },
         created_at=created_at,
     )
-    return queue_path
 
 
 def set_old_mtime(path: Path, age_seconds: int):
@@ -173,47 +172,34 @@ def test_hook_build_job_initializes_retry_count(tmp_path, hook):
     assert job["retry_count"] == 0
 
 
-def test_hook_main_records_last_real_stop_marker(tmp_path, hook):
-    transcript = tmp_path / "transcript.jsonl"
-    transcript.write_text('{"hello":"world"}\n', encoding="utf-8")
-    payload = json.dumps(
-        {
-            "session_id": "session-1",
-            "turn_id": "turn-1",
-            "transcript_path": str(transcript),
-            "cwd": "/tmp/project",
-            "model": "gpt-5",
-            "hook_event_name": "Stop",
-        }
+def test_hook_build_job_rejects_missing_transcript_path(hook):
+    with pytest.raises(ValueError, match="transcript_path missing"):
+        hook.build_job(
+            {
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "transcript_path": None,
+            },
+            created_at="2026-04-16T00:00:00.000Z",
+        )
+
+
+def test_hook_main_logs_and_skips_enqueue_when_transcript_path_missing(tmp_path, hook):
+    state_root = tmp_path / "state"
+    result = hook.main(
+        ["--state-root", str(state_root)],
+        stdin_text=json.dumps(
+            {
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "transcript_path": None,
+            }
+        ),
     )
 
-    exit_code = hook.main(["--state-root", str(tmp_path)], stdin_text=payload)
-
-    assert exit_code == 0
-    marker = read_json(tmp_path / "last-real-stop-hook.json")
-    assert marker["session_id"] == "session-1"
-    assert marker["turn_id"] == "turn-1"
-    assert marker["transcript_path"] == str(transcript)
-
-
-def test_hook_main_ignores_smoke_test_for_last_real_stop_marker(tmp_path, hook):
-    transcript = tmp_path / "transcript.jsonl"
-    transcript.write_text('{"hello":"world"}\n', encoding="utf-8")
-    payload = json.dumps(
-        {
-            "session_id": "smoke-test",
-            "turn_id": "turn-smoke",
-            "transcript_path": str(transcript),
-            "cwd": "/tmp/project",
-            "model": "smoke-test",
-            "hook_event_name": "Stop",
-        }
-    )
-
-    exit_code = hook.main(["--state-root", str(tmp_path)], stdin_text=payload)
-
-    assert exit_code == 0
-    assert not (tmp_path / "last-real-stop-hook.json").exists()
+    assert result == 0
+    assert list((state_root / "queue").glob("*.json")) == []
+    assert "transcript_path missing" in (state_root / "logs" / "hook-stop.log").read_text(encoding="utf-8")
 
 
 def test_read_incremental_bytes_from_offset_and_checkpoint_advances(tmp_path, daemon, hook):
@@ -494,6 +480,37 @@ def test_empty_read_after_prior_success_deletes_job_without_stall(tmp_path, daem
     assert sleep_calls == []
     assert not job_path.exists()
     assert not (tmp_path / "queue" / "dead" / job_path.name).exists()
+
+
+def test_process_next_job_dead_letters_invalid_job_without_crashing(tmp_path, daemon, caplog):
+    config = make_config(tmp_path)
+    job_path = tmp_path / "queue" / "bad.json"
+    daemon.write_json_atomic(
+        job_path,
+        {
+            "job_type": "codex_stop_archive",
+            "created_at": "2026-04-16T00:00:00.000Z",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "transcript_path": None,
+        },
+    )
+
+    caplog.set_level("WARNING")
+    result = daemon.process_next_job(
+        tmp_path,
+        config,
+        sleep_fn=lambda _: None,
+        now_fn=lambda: "2026-04-16T00:00:01.000Z",
+    )
+
+    dead_path = tmp_path / "queue" / "dead" / job_path.name
+    heartbeat = read_json(tmp_path / "heartbeat.json")
+    assert result["status"] == "invalid_job"
+    assert dead_path.exists()
+    assert not job_path.exists()
+    assert heartbeat["last_error"] == "archive_invalid_job: transcript_path missing"
+    assert "archive_invalid_job" in caplog.text
 
 
 def test_stall_count_increments_resets_on_success_and_dead_letters_after_max(tmp_path, daemon, hook, monkeypatch):
@@ -834,3 +851,27 @@ def test_s3_key_matches_expected_structure(tmp_path, daemon):
         s3_key,
     )
     assert f"/{tp_hash[:8]}/" in s3_key
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_exit_code"),
+    [
+        ("uploaded", 0),
+        ("idle", 0),
+        ("invalid_job", 1),
+        ("upload_failed", 1),
+    ],
+)
+def test_main_once_maps_result_status_to_exit_code(tmp_path, daemon, monkeypatch, status, expected_exit_code):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+
+    def fake_run_daemon(state_root, config, *, once=False):
+        assert once is True
+        return {"status": status}
+
+    monkeypatch.setattr(daemon, "run_daemon", fake_run_daemon)
+
+    exit_code = daemon.main(["--state-root", str(tmp_path), "--config", str(config_path), "--once"])
+
+    assert exit_code == expected_exit_code

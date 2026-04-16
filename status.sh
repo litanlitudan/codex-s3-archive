@@ -56,6 +56,8 @@ service_state() {
   if [ "$PLATFORM" = "Darwin" ]; then
     if launchctl list "${SERVICE_LABEL}" >/dev/null 2>&1; then
       echo "running"
+    elif daemon_is_running; then
+      echo "running"
     else
       echo "stopped"
     fi
@@ -170,33 +172,6 @@ except Exception:
 ' "$heartbeat_path"
 }
 
-real_hook_info() {
-  local marker_path="${STATE_ROOT}/last-real-stop-hook.json"
-  if [ ! -f "$marker_path" ]; then
-    echo "never|-1|unknown"
-    return 0
-  fi
-
-  "${PYTHON3_PATH}" -c '
-import datetime
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-try:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    value = data["seen_at"]
-    dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    now = datetime.datetime.now(datetime.timezone.utc)
-    age = max(int((now - dt).total_seconds()), 0)
-    session_id = data.get("session_id") or "unknown"
-    print(f"{age}s_ago|{age}|{session_id}")
-except Exception:
-    print("never|-1|unknown")
-' "$marker_path"
-}
-
 count_json_files() {
   local dir="$1"
   if [ ! -d "$dir" ]; then
@@ -227,10 +202,6 @@ main() {
   local queue_count
   local dead_count
   local staging_count
-  local real_hook_triplet
-  local real_hook_display
-  local real_hook_age
-  local real_hook_session
   local overall
   local exit_code
 
@@ -238,11 +209,6 @@ main() {
   heartbeat_pair="$(heartbeat_info)"
   heartbeat_display="${heartbeat_pair%%|*}"
   heartbeat_age="${heartbeat_pair##*|}"
-  real_hook_triplet="$(real_hook_info)"
-  real_hook_display="${real_hook_triplet%%|*}"
-  real_hook_age="${real_hook_triplet#*|}"
-  real_hook_session="${real_hook_age#*|}"
-  real_hook_age="${real_hook_age%%|*}"
   queue_count="$(count_json_files "${STATE_ROOT}/queue")"
   dead_count="$(count_json_files "${STATE_ROOT}/queue/dead")"
   staging_count="$(count_files "${STATE_ROOT}/staging")"
@@ -258,8 +224,8 @@ main() {
     exit_code=0
   fi
 
-  printf '%-8s service=%s  heartbeat=%s  real_hook=%s  real_session=%s  queue=%s  dead=%s  staging=%s\n' \
-    "$overall" "$service" "$heartbeat_display" "$real_hook_display" "$real_hook_session" "$queue_count" "$dead_count" "$staging_count"
+  printf '%-8s service=%s  heartbeat=%s  queue=%s  dead=%s  staging=%s\n' \
+    "$overall" "$service" "$heartbeat_display" "$queue_count" "$dead_count" "$staging_count"
   exit "$exit_code"
 }
 
