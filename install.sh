@@ -14,6 +14,7 @@ SERVICE_NAME="codex-s3-archive"
 PLATFORM=""
 UV_PATH=""
 PYTHON3_PATH=""
+SYSTEMD_CHECK_ERROR=""
 
 USER_ID=""
 PROVIDER=""
@@ -28,8 +29,10 @@ HOOKS_BACKUP_PATH=""
 SMOKE_TEST_STATUS="not_run"
 SERVICE_SUMMARY="unknown"
 
-ARCHIVE_HOOK_COMMAND='$HOME/.codex/s3-archive/bin/codex-s3-archive-hook-stop --state-root $HOME/.codex/s3-archive'
-WRAPPER_COMMAND='$HOME/.codex/s3-archive/bin/stop-wrapper.sh'
+ARCHIVE_HOOK_COMMAND=""
+WRAPPER_COMMAND=""
+LEGACY_ARCHIVE_HOOK_COMMAND='$HOME/.codex/s3-archive/bin/codex-s3-archive-hook-stop --state-root $HOME/.codex/s3-archive'
+LEGACY_WRAPPER_COMMAND='$HOME/.codex/s3-archive/bin/stop-wrapper.sh'
 
 fail() {
   echo "ERROR: $*" >&2
@@ -40,6 +43,10 @@ require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     fail "required command not found: $1"
   fi
+}
+
+shell_quote() {
+  printf '%q' "$1"
 }
 
 usage() {
@@ -145,6 +152,16 @@ parse_cli_args() {
         ;;
     esac
   done
+}
+
+build_hook_commands() {
+  local hook_bin wrapper_bin quoted_state_root
+  hook_bin="$(shell_quote "${STATE_ROOT}/bin/codex-s3-archive-hook-stop")"
+  wrapper_bin="$(shell_quote "${STATE_ROOT}/bin/stop-wrapper.sh")"
+  quoted_state_root="$(shell_quote "${STATE_ROOT}")"
+
+  ARCHIVE_HOOK_COMMAND="${hook_bin} --state-root ${quoted_state_root}"
+  WRAPPER_COMMAND="${wrapper_bin} --state-root ${quoted_state_root}"
 }
 
 ensure_tty() {
@@ -331,6 +348,8 @@ hooks_path = pathlib.Path(sys.argv[1])
 state_root = pathlib.Path(sys.argv[2])
 archive_command = sys.argv[3]
 wrapper_command = sys.argv[4]
+legacy_archive_command = sys.argv[5]
+legacy_wrapper_command = sys.argv[6]
 
 if hooks_path.exists():
     data = json.loads(hooks_path.read_text(encoding="utf-8"))
@@ -351,7 +370,12 @@ for entry in stop_entries:
     if isinstance(hooks, list):
         all_hooks.extend(hooks)
 
-managed_commands = {archive_command, wrapper_command}
+managed_commands = {
+    archive_command,
+    wrapper_command,
+    legacy_archive_command,
+    legacy_wrapper_command,
+}
 command_hooks = [
     hook for hook in all_hooks
     if isinstance(hook, dict) and hook.get("type") == "command" and hook.get("command")
@@ -390,7 +414,7 @@ for entry in stop_entries[1:]:
     entry["hooks"] = []
 
 hooks_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-' "$HOOKS_JSON" "$STATE_ROOT" "$ARCHIVE_HOOK_COMMAND" "$WRAPPER_COMMAND"
+' "$HOOKS_JSON" "$STATE_ROOT" "$ARCHIVE_HOOK_COMMAND" "$WRAPPER_COMMAND" "$LEGACY_ARCHIVE_HOOK_COMMAND" "$LEGACY_WRAPPER_COMMAND"
 }
 
 install_service() {
@@ -449,9 +473,14 @@ StandardError=append:${STATE_ROOT}/logs/daemon.stderr.log
 [Install]
 WantedBy=default.target
 EOF
-    systemctl --user daemon-reload
-    systemctl --user enable --now "${SERVICE_NAME}"
-    SERVICE_SUMMARY="running (${SERVICE_NAME})"
+    if linux_systemd_user_available; then
+      systemctl --user daemon-reload
+      systemctl --user enable --now "${SERVICE_NAME}"
+      SERVICE_SUMMARY="running (${SERVICE_NAME})"
+    else
+      install_nohup_supervisor
+      SERVICE_SUMMARY="running (nohup fallback)"
+    fi
   fi
 }
 
@@ -459,7 +488,112 @@ service_is_running() {
   if [ "$PLATFORM" = "Darwin" ]; then
     launchctl list "${SERVICE_LABEL}" >/dev/null 2>&1
   else
-    [ "$(systemctl --user is-active "${SERVICE_NAME}" 2>/dev/null || true)" = "active" ]
+    if [ "$(systemctl --user is-active "${SERVICE_NAME}" 2>/dev/null || true)" = "active" ]; then
+      return 0
+    fi
+    nohup_supervisor_is_running
+  fi
+}
+
+linux_systemd_user_available() {
+  if [ "$PLATFORM" != "Linux" ]; then
+    return 1
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    SYSTEMD_CHECK_ERROR="systemctl not found"
+    return 1
+  fi
+
+  if ! SYSTEMD_CHECK_ERROR="$(systemctl --user show-environment 2>&1)"; then
+    SYSTEMD_CHECK_ERROR="${SYSTEMD_CHECK_ERROR:-systemctl --user show-environment failed}"
+    return 1
+  fi
+
+  SYSTEMD_CHECK_ERROR=""
+  return 0
+}
+
+nohup_supervisor_pid_path() {
+  printf '%s\n' "${STATE_ROOT}/daemon-supervisor.pid"
+}
+
+nohup_supervisor_path() {
+  printf '%s\n' "${STATE_ROOT}/bin/codex-s3-archive-supervisor.sh"
+}
+
+nohup_supervisor_is_running() {
+  local pid_path pid
+  pid_path="$(nohup_supervisor_pid_path)"
+  if [ ! -f "$pid_path" ]; then
+    return 1
+  fi
+
+  pid="$(cat "$pid_path" 2>/dev/null || true)"
+  if [ -z "$pid" ]; then
+    return 1
+  fi
+
+  kill -0 "$pid" >/dev/null 2>&1 && nohup_supervisor_pid_matches "$pid"
+}
+
+nohup_supervisor_pid_matches() {
+  local pid="$1"
+  local command_line
+  command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [ -n "$command_line" ] || return 1
+  case "$command_line" in
+    *"${STATE_ROOT}/bin/codex-s3-archive-supervisor.sh"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+write_nohup_supervisor() {
+  local supervisor_path
+  supervisor_path="$(nohup_supervisor_path)"
+
+  cat >"$supervisor_path" <<EOF
+#!/bin/bash
+set -euo pipefail
+
+while true; do
+  "${UV_PATH}" run --script "${STATE_ROOT}/bin/codex-s3-archive-daemon" --state-root "${STATE_ROOT}" --config "${STATE_ROOT}/config.json" >>"${STATE_ROOT}/logs/daemon.stdout.log" 2>>"${STATE_ROOT}/logs/daemon.stderr.log"
+  sleep 2
+done
+EOF
+  chmod +x "$supervisor_path"
+}
+
+stop_nohup_supervisor() {
+  local pid_path pid
+  pid_path="$(nohup_supervisor_pid_path)"
+  if [ ! -f "$pid_path" ]; then
+    return 0
+  fi
+
+  pid="$(cat "$pid_path" 2>/dev/null || true)"
+  if [ -n "$pid" ] && nohup_supervisor_pid_matches "$pid"; then
+    kill "$pid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$pid_path"
+}
+
+install_nohup_supervisor() {
+  local pid_path supervisor_path
+  pid_path="$(nohup_supervisor_pid_path)"
+  supervisor_path="$(nohup_supervisor_path)"
+
+  stop_nohup_supervisor
+  write_nohup_supervisor
+  nohup "$supervisor_path" >/dev/null 2>&1 </dev/null &
+  printf '%s\n' "$!" >"$pid_path"
+
+  if [ -n "$SYSTEMD_CHECK_ERROR" ]; then
+    echo "WARN: systemd --user unavailable, using nohup fallback: ${SYSTEMD_CHECK_ERROR}" >&2
   fi
 }
 
@@ -585,6 +719,7 @@ main() {
   detect_uv
   detect_python
   parse_cli_args "$@"
+  build_hook_commands
   interactive_prompts
   create_state_dirs
   download_scripts

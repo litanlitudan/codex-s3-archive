@@ -62,10 +62,42 @@ service_state() {
   else
     if [ "$(systemctl --user is-active "${SERVICE_NAME}" 2>/dev/null || true)" = "active" ]; then
       echo "running"
+    elif nohup_supervisor_is_running; then
+      echo "running"
     else
       echo "stopped"
     fi
   fi
+}
+
+nohup_supervisor_is_running() {
+  local pid_path pid
+  pid_path="${STATE_ROOT}/daemon-supervisor.pid"
+  if [ ! -f "$pid_path" ]; then
+    return 1
+  fi
+
+  pid="$(cat "$pid_path" 2>/dev/null || true)"
+  if [ -z "$pid" ]; then
+    return 1
+  fi
+
+  kill -0 "$pid" >/dev/null 2>&1 && nohup_supervisor_pid_matches "$pid"
+}
+
+nohup_supervisor_pid_matches() {
+  local pid="$1"
+  local command_line
+  command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [ -n "$command_line" ] || return 1
+  case "$command_line" in
+    *"${STATE_ROOT}/bin/codex-s3-archive-supervisor.sh"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 heartbeat_info() {
