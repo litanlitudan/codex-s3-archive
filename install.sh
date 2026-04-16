@@ -14,6 +14,7 @@ SERVICE_NAME="codex-s3-archive"
 PLATFORM=""
 UV_PATH=""
 PYTHON3_PATH=""
+CODEX_PATH=""
 SYSTEMD_CHECK_ERROR=""
 
 USER_ID=""
@@ -98,6 +99,10 @@ detect_python() {
   if [ -z "$PYTHON3_PATH" ]; then
     fail "python3 not found"
   fi
+}
+
+detect_codex() {
+  CODEX_PATH="$(command -v codex 2>/dev/null || true)"
 }
 
 parse_cli_args() {
@@ -415,6 +420,67 @@ for entry in stop_entries[1:]:
 
 hooks_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 ' "$HOOKS_JSON" "$STATE_ROOT" "$ARCHIVE_HOOK_COMMAND" "$WRAPPER_COMMAND" "$LEGACY_ARCHIVE_HOOK_COMMAND" "$LEGACY_WRAPPER_COMMAND"
+}
+
+codex_hooks_feature_state() {
+  if [ -z "$CODEX_PATH" ]; then
+    echo "unavailable"
+    return 0
+  fi
+
+  "${CODEX_PATH}" features list 2>/dev/null | awk '$1=="codex_hooks"{print $3; found=1} END {if (!found) print "unknown"}'
+}
+
+ensure_codex_hooks_feature_enabled() {
+  local feature_state
+  feature_state="$(codex_hooks_feature_state)"
+
+  case "$feature_state" in
+    true)
+      return 0
+      ;;
+    false)
+      if ! "${CODEX_PATH}" features enable codex_hooks >/dev/null 2>&1; then
+        echo "WARN: failed to enable codex_hooks via codex features enable codex_hooks" >&2
+        return 0
+      fi
+      ;;
+    unavailable)
+      echo "WARN: codex command not found; could not verify codex_hooks feature state" >&2
+      return 0
+      ;;
+    *)
+      echo "WARN: could not determine codex_hooks feature state (got: ${feature_state})" >&2
+      return 0
+      ;;
+  esac
+
+  feature_state="$(codex_hooks_feature_state)"
+  if [ "$feature_state" != "true" ]; then
+    echo "WARN: codex_hooks feature is still not enabled; live Stop hooks may not execute" >&2
+  fi
+}
+
+assert_codex_hooks_feature_enabled() {
+  local feature_state
+  feature_state="$(codex_hooks_feature_state)"
+
+  case "$feature_state" in
+    true)
+      return 0
+      ;;
+    false)
+      fail "codex_hooks feature is disabled; install would pass smoke test but live Codex Stop hooks will not fire"
+      ;;
+    unavailable)
+      echo "WARN: codex command not found; skipping codex_hooks feature verification" >&2
+      return 0
+      ;;
+    *)
+      echo "WARN: unable to verify codex_hooks feature state before smoke test (got: ${feature_state})" >&2
+      return 0
+      ;;
+  esac
 }
 
 install_service() {
@@ -741,6 +807,7 @@ print_smoke_diagnostics() {
 }
 
 smoke_test() {
+  assert_codex_hooks_feature_enabled
   sleep 3
 
   local age=""
@@ -818,6 +885,7 @@ main() {
   detect_platform
   detect_uv
   detect_python
+  detect_codex
   parse_cli_args "$@"
   build_hook_commands
   interactive_prompts
@@ -826,6 +894,7 @@ main() {
   write_credentials_json
   write_config_json
   merge_hooks_json
+  ensure_codex_hooks_feature_enabled
   install_service
   smoke_test
   print_summary

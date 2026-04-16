@@ -64,7 +64,7 @@ def write_credentials(state_root: Path, access_key="AKIA_TEST", secret_key="secr
 
 
 def enqueue_job(hook, state_root: Path, transcript: Path, *, session_id="session-1", turn_id="turn-1", created_at="2026-04-16T00:00:00.000Z"):
-    return hook.enqueue_job(
+    queue_path, _job = hook.enqueue_job(
         state_root,
         {
             "session_id": session_id,
@@ -76,6 +76,7 @@ def enqueue_job(hook, state_root: Path, transcript: Path, *, session_id="session
         },
         created_at=created_at,
     )
+    return queue_path
 
 
 def set_old_mtime(path: Path, age_seconds: int):
@@ -170,6 +171,49 @@ def test_hook_build_job_initializes_retry_count(tmp_path, hook):
     )
 
     assert job["retry_count"] == 0
+
+
+def test_hook_main_records_last_real_stop_marker(tmp_path, hook):
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"hello":"world"}\n', encoding="utf-8")
+    payload = json.dumps(
+        {
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "transcript_path": str(transcript),
+            "cwd": "/tmp/project",
+            "model": "gpt-5",
+            "hook_event_name": "Stop",
+        }
+    )
+
+    exit_code = hook.main(["--state-root", str(tmp_path)], stdin_text=payload)
+
+    assert exit_code == 0
+    marker = read_json(tmp_path / "last-real-stop-hook.json")
+    assert marker["session_id"] == "session-1"
+    assert marker["turn_id"] == "turn-1"
+    assert marker["transcript_path"] == str(transcript)
+
+
+def test_hook_main_ignores_smoke_test_for_last_real_stop_marker(tmp_path, hook):
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"hello":"world"}\n', encoding="utf-8")
+    payload = json.dumps(
+        {
+            "session_id": "smoke-test",
+            "turn_id": "turn-smoke",
+            "transcript_path": str(transcript),
+            "cwd": "/tmp/project",
+            "model": "smoke-test",
+            "hook_event_name": "Stop",
+        }
+    )
+
+    exit_code = hook.main(["--state-root", str(tmp_path)], stdin_text=payload)
+
+    assert exit_code == 0
+    assert not (tmp_path / "last-real-stop-hook.json").exists()
 
 
 def test_read_incremental_bytes_from_offset_and_checkpoint_advances(tmp_path, daemon, hook):
