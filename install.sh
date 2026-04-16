@@ -479,7 +479,14 @@ EOF
       SERVICE_SUMMARY="running (${SERVICE_NAME})"
     else
       install_nohup_supervisor
-      SERVICE_SUMMARY="running (nohup fallback)"
+      case "$SYSTEMD_CHECK_ERROR" in
+        container\ environment\ detected*)
+          SERVICE_SUMMARY="running (container nohup fallback)"
+          ;;
+        *)
+          SERVICE_SUMMARY="running (nohup fallback)"
+          ;;
+      esac
     fi
   fi
 }
@@ -500,6 +507,11 @@ linux_systemd_user_available() {
     return 1
   fi
 
+  if linux_container_environment; then
+    SYSTEMD_CHECK_ERROR="container environment detected; skipping systemd --user"
+    return 1
+  fi
+
   if ! command -v systemctl >/dev/null 2>&1; then
     SYSTEMD_CHECK_ERROR="systemctl not found"
     return 1
@@ -512,6 +524,22 @@ linux_systemd_user_available() {
 
   SYSTEMD_CHECK_ERROR=""
   return 0
+}
+
+linux_container_environment() {
+  if [ "$PLATFORM" != "Linux" ]; then
+    return 1
+  fi
+
+  if [ -f "/.dockerenv" ] || [ -f "/run/.containerenv" ]; then
+    return 0
+  fi
+
+  if [ -n "${container:-}" ]; then
+    return 0
+  fi
+
+  grep -qaE '/(docker|kubepods|containerd|podman|lxc)/' /proc/1/cgroup 2>/dev/null
 }
 
 nohup_supervisor_pid_path() {
