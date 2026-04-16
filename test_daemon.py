@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 from unittest.mock import Mock
@@ -61,6 +62,36 @@ def write_credentials(state_root: Path, access_key="AKIA_TEST", secret_key="secr
         encoding="utf-8",
     )
     return creds_path
+
+
+def make_fake_service_commands(bin_dir: Path, *, systemctl_status="inactive"):
+    (bin_dir / "uname").write_text("#!/bin/sh\nprintf 'Linux\\n'\n", encoding="utf-8")
+    (bin_dir / "systemctl").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--user\" ] && [ \"$2\" = \"is-active\" ]; then\n"
+        f"  printf '{systemctl_status}\\n'\n"
+        f"  [ '{systemctl_status}' = 'active' ] && exit 0 || exit 3\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    for path in (bin_dir / "uname", bin_dir / "systemctl"):
+        path.chmod(0o755)
+
+
+def run_status_script(tmp_path: Path, *, systemctl_status="active"):
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    make_fake_service_commands(bin_dir, systemctl_status=systemctl_status)
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    return subprocess.run(
+        ["bash", str(SCRIPT_DIR / "status.sh"), "--state-root", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
 
 
 def enqueue_job(hook, state_root: Path, transcript: Path, *, session_id="session-1", turn_id="turn-1", created_at="2026-04-16T00:00:00.000Z"):
@@ -922,6 +953,65 @@ def test_main_once_maps_result_status_to_exit_code(tmp_path, daemon, monkeypatch
     exit_code = daemon.main(["--state-root", str(tmp_path), "--config", str(config_path), "--once"])
 
     assert exit_code == expected_exit_code
+
+
+def test_status_reports_retrying_jobs_and_last_error(tmp_path):
+    (tmp_path / "queue").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "queue" / "dead").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "staging").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "heartbeat.json").write_text(
+        json.dumps(
+            {
+                "last_cycle_at": "2999-01-01T00:00:00.000Z",
+                "queue_len": 1,
+                "last_success_s3_key": "raw/example",
+                "last_error": "archive_upload_failed: EndpointConnectionError",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "queue" / "retrying.json").write_text(
+        json.dumps(
+            {
+                "retry_count": 2,
+                "session_id": "session-1",
+                "transcript_path": "/tmp/example.jsonl",
+                "created_at": "2026-04-16T00:00:00.000Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_status_script(tmp_path, systemctl_status="active")
+
+    assert result.returncode == 1
+    assert "service=running" in result.stdout
+    assert "retrying=1" in result.stdout
+    assert 'last_error="archive_upload_failed: EndpointConnectionError"' in result.stdout
+
+
+def test_status_reports_ok_when_running_and_clean(tmp_path):
+    (tmp_path / "queue").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "queue" / "dead").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "staging").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "heartbeat.json").write_text(
+        json.dumps(
+            {
+                "last_cycle_at": "2999-01-01T00:00:00.000Z",
+                "queue_len": 0,
+                "last_success_s3_key": "raw/example",
+                "last_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_status_script(tmp_path, systemctl_status="active")
+
+    assert result.returncode == 0
+    assert result.stdout.startswith("OK")
+    assert "retrying=0" in result.stdout
+    assert 'last_error=""' in result.stdout
 
 
 def test_missing_transcript_is_retried_then_dead_lettered_after_ttl(tmp_path, daemon):

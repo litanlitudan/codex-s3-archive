@@ -19,7 +19,7 @@ detect_platform() {
       PLATFORM="$(uname -s)"
       ;;
     *)
-      echo "DEAD     service=unknown  heartbeat=never  queue=0  dead=0  staging=0"
+      echo 'DEAD     service=unknown  heartbeat=never  queue=0  dead=0  staging=0  retrying=0  last_error="unknown_platform"'
       exit 2
       ;;
   esac
@@ -28,7 +28,7 @@ detect_platform() {
 detect_python() {
   PYTHON3_PATH="$(command -v python3 2>/dev/null || true)"
   if [ -z "$PYTHON3_PATH" ]; then
-    echo "DEAD     service=unknown  heartbeat=never  queue=0  dead=0  staging=0"
+    echo 'DEAD     service=unknown  heartbeat=never  queue=0  dead=0  staging=0  retrying=0  last_error="python3_missing"'
     exit 2
   fi
 }
@@ -149,7 +149,7 @@ daemon_process_matches() {
 heartbeat_info() {
   local heartbeat_path="${STATE_ROOT}/heartbeat.json"
   if [ ! -f "$heartbeat_path" ]; then
-    echo "never|-1"
+    printf 'never\t-1\t"heartbeat_missing"\n'
     return 0
   fi
 
@@ -166,9 +166,11 @@ try:
     dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
     now = datetime.datetime.now(datetime.timezone.utc)
     age = max(int((now - dt).total_seconds()), 0)
-    print(f"{age}s_ago|{age}")
+    last_error = data.get("last_error")
+    encoded_error = json.dumps(last_error or "")
+    print(f"{age}s_ago\t{age}\t{encoded_error}")
 except Exception:
-    print("never|-1")
+    print("never\t-1\t\"heartbeat_invalid\"")
 ' "$heartbeat_path"
 }
 
@@ -190,6 +192,31 @@ count_files() {
   find "$dir" -maxdepth 1 -type f | wc -l | awk '{print $1}'
 }
 
+count_retrying_jobs() {
+  local queue_dir="${STATE_ROOT}/queue"
+  if [ ! -d "$queue_dir" ]; then
+    echo "0"
+    return 0
+  fi
+
+  "${PYTHON3_PATH}" -c '
+import json
+import pathlib
+import sys
+
+queue_dir = pathlib.Path(sys.argv[1])
+count = 0
+for path in queue_dir.glob("*.json"):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    if int(data.get("retry_count", 0) or 0) > 0:
+        count += 1
+print(count)
+' "$queue_dir"
+}
+
 main() {
   parse_cli_args "$@"
   detect_platform
@@ -199,24 +226,28 @@ main() {
   local heartbeat_pair
   local heartbeat_display
   local heartbeat_age
+  local last_error
   local queue_count
   local dead_count
   local staging_count
+  local retrying_count
   local overall
   local exit_code
 
   service="$(service_state)"
   heartbeat_pair="$(heartbeat_info)"
-  heartbeat_display="${heartbeat_pair%%|*}"
-  heartbeat_age="${heartbeat_pair##*|}"
+  heartbeat_display="$(printf '%s' "$heartbeat_pair" | cut -f1)"
+  heartbeat_age="$(printf '%s' "$heartbeat_pair" | cut -f2)"
+  last_error="$(printf '%s' "$heartbeat_pair" | cut -f3-)"
   queue_count="$(count_json_files "${STATE_ROOT}/queue")"
   dead_count="$(count_json_files "${STATE_ROOT}/queue/dead")"
   staging_count="$(count_files "${STATE_ROOT}/staging")"
+  retrying_count="$(count_retrying_jobs)"
 
   if [ "$service" != "running" ] || [ "$heartbeat_age" -lt 0 ]; then
     overall="DEAD"
     exit_code=2
-  elif [ "$heartbeat_age" -gt 300 ] || [ "$dead_count" -gt 0 ] || [ "$staging_count" -gt 0 ]; then
+  elif [ "$heartbeat_age" -gt 300 ] || [ "$dead_count" -gt 0 ] || [ "$staging_count" -gt 0 ] || [ "$retrying_count" -gt 0 ] || [ "$last_error" != '""' ]; then
     overall="WARN"
     exit_code=1
   else
@@ -224,8 +255,8 @@ main() {
     exit_code=0
   fi
 
-  printf '%-8s service=%s  heartbeat=%s  queue=%s  dead=%s  staging=%s\n' \
-    "$overall" "$service" "$heartbeat_display" "$queue_count" "$dead_count" "$staging_count"
+  printf '%-8s service=%s  heartbeat=%s  queue=%s  dead=%s  staging=%s  retrying=%s  last_error=%s\n' \
+    "$overall" "$service" "$heartbeat_display" "$queue_count" "$dead_count" "$staging_count" "$retrying_count" "$last_error"
   exit "$exit_code"
 }
 
