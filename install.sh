@@ -25,6 +25,7 @@ AWS_REGION=""
 R2_ACCOUNT_ID=""
 ACCESS_KEY_ID=""
 SECRET_ACCESS_KEY=""
+OTEL_ENDPOINT=""
 EXISTING_USER_ID=""
 EXISTING_PROVIDER=""
 EXISTING_BUCKET=""
@@ -33,6 +34,7 @@ EXISTING_AWS_REGION=""
 EXISTING_R2_ACCOUNT_ID=""
 EXISTING_ACCESS_KEY_ID=""
 EXISTING_SECRET_ACCESS_KEY=""
+EXISTING_OTEL_ENDPOINT=""
 HAS_EXISTING_INSTALL=0
 
 CLI_USER_ID=0
@@ -43,6 +45,7 @@ CLI_AWS_REGION=0
 CLI_R2_ACCOUNT_ID=0
 CLI_ACCESS_KEY_ID=0
 CLI_SECRET_ACCESS_KEY=0
+CLI_OTEL_ENDPOINT=0
 
 HOOKS_BACKUP_PATH=""
 SMOKE_TEST_STATUS="not_run"
@@ -83,6 +86,7 @@ Options:
   --r2-account-id VALUE
   --access-key-id VALUE
   --secret-access-key VALUE
+  --otel-endpoint VALUE
   --gist-base URL
   --state-root PATH
   --help
@@ -162,6 +166,11 @@ parse_cli_args() {
       --secret-access-key)
         SECRET_ACCESS_KEY="${2:-}"
         CLI_SECRET_ACCESS_KEY=1
+        shift 2
+        ;;
+      --otel-endpoint)
+        OTEL_ENDPOINT="${2:-}"
+        CLI_OTEL_ENDPOINT=1
         shift 2
         ;;
       --gist-base)
@@ -349,6 +358,36 @@ for key in (
   EXISTING_SECRET_ACCESS_KEY="${lines[7]:-}"
 }
 
+load_existing_codex_config_state() {
+  if [ ! -f "$CODEX_CONFIG_TOML" ]; then
+    return 0
+  fi
+
+  EXISTING_OTEL_ENDPOINT="$("${PYTHON3_PATH}" -c '
+import pathlib
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
+
+path = pathlib.Path(sys.argv[1])
+
+if tomllib is not None:
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        otel = data.get("otel") or {}
+        exporter = otel.get("exporter") or {}
+        otlp_grpc = exporter.get("otlp-grpc") or {}
+        print(str(otlp_grpc.get("endpoint") or ""))
+    except Exception:
+        print("")
+else:
+    print("")
+' "$CODEX_CONFIG_TOML")"
+}
+
 clear_runtime_state() {
   local target_root="${1:-$STATE_ROOT}"
   rm -f \
@@ -389,6 +428,8 @@ interactive_prompts() {
     prompt_value SECRET_ACCESS_KEY "R2 Secret Access Key" "${EXISTING_SECRET_ACCESS_KEY}" 1 "${EXISTING_SECRET_ACCESS_KEY:+saved}"
     AWS_REGION=""
   fi
+
+  prompt_value OTEL_ENDPOINT "OTel Collector endpoint" "${EXISTING_OTEL_ENDPOINT:-https://otel-collector-signoz.fly.dev:443}"
 }
 
 create_state_dirs() {
@@ -493,79 +534,141 @@ backup_hooks_json() {
   fi
 }
 
-ensure_codex_features_config() {
+ensure_codex_config() {
   mkdir -p "${HOME}/.codex"
 
   CODEX_CONFIG_SUMMARY="$("${PYTHON3_PATH}" -c '
+import json
 import pathlib
 import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
+otel_endpoint = sys.argv[2]
 
 header_re = re.compile(r"^\s*\[([^\]]+)\]\s*$")
-setting_re = re.compile(r"^(\s*)codex_hooks\s*=\s*(true|false)(\s*(?:#.*)?)$")
+feature_setting_re = re.compile(r"^\s*codex_hooks\s*=")
+otel_log_prompt_re = re.compile(r"^\s*log_user_prompt\s*=")
+otel_exporter_re = re.compile(r"^\s*exporter\s*=")
 
 if path.exists():
-    text = path.read_text(encoding="utf-8")
+    original_text = path.read_text(encoding="utf-8")
 else:
-    text = ""
+    original_text = ""
 
-if not text.strip():
-    path.write_text("[features]\ncodex_hooks = true\n", encoding="utf-8")
-    print("created")
-    raise SystemExit(0)
+lines = original_text.splitlines(keepends=True)
 
-lines = text.splitlines(keepends=True)
-features_start = None
-features_end = len(lines)
-
+sections = []
 for index, line in enumerate(lines):
     match = header_re.match(line)
-    if not match:
+    if not match or line.lstrip().startswith("[["):
         continue
-    if match.group(1).strip() == "features":
-        features_start = index
-        break
+    sections.append((match.group(1).strip(), index))
 
-if features_start is None:
-    if text and not text.endswith("\n"):
-        text += "\n"
-    if text.strip():
-        text += "\n"
-    text += "[features]\ncodex_hooks = true\n"
-    path.write_text(text, encoding="utf-8")
+section_spans = {}
+for idx, (name, start) in enumerate(sections):
+    end = sections[idx + 1][1] if idx + 1 < len(sections) else len(lines)
+    section_spans[name] = (start, end)
+
+def trim_trailing_blank_lines(section_lines):
+    trimmed = list(section_lines)
+    while trimmed and not trimmed[-1].strip():
+        trimmed.pop()
+    return trimmed
+
+def toml_string(value):
+    return json.dumps(value, ensure_ascii=False)
+
+def update_features_body(body_lines):
+    updated = [line for line in body_lines if not feature_setting_re.match(line)]
+    updated = trim_trailing_blank_lines(updated)
+    if updated and updated[-1].strip():
+        updated.append("\n")
+    updated.append("codex_hooks = true\n")
+    return updated
+
+def update_otel_body(body_lines):
+    updated = []
+    skip_exporter = False
+    brace_balance = 0
+
+    for line in body_lines:
+        if skip_exporter:
+            brace_balance += line.count("{") - line.count("}")
+            if brace_balance <= 0:
+                skip_exporter = False
+            continue
+        if otel_log_prompt_re.match(line):
+            continue
+        if otel_exporter_re.match(line):
+            brace_balance = line.count("{") - line.count("}")
+            if brace_balance > 0:
+                skip_exporter = True
+            continue
+        updated.append(line)
+
+    updated = trim_trailing_blank_lines(updated)
+    if updated and updated[-1].strip():
+        updated.append("\n")
+    updated.append("log_user_prompt = true\n")
+    updated.append(
+        "exporter = { otlp-grpc = { endpoint = "
+        + toml_string(otel_endpoint)
+        + " } }\n"
+    )
+    return updated
+
+managed_sections = {
+    "features": update_features_body,
+    "otel": update_otel_body,
+}
+
+result = []
+cursor = 0
+for name, start in sections:
+    end = section_spans[name][1]
+    result.extend(lines[cursor:start])
+    if name in managed_sections:
+        body = managed_sections[name](lines[start + 1:end])
+        result.append(f"[{name}]\n")
+        result.extend(body)
+    else:
+        result.extend(lines[start:end])
+    cursor = end
+result.extend(lines[cursor:])
+
+def append_section(result_lines, name, body_lines):
+    if result_lines and not result_lines[-1].endswith("\n"):
+        result_lines[-1] += "\n"
+    if result_lines and result_lines[-1].strip():
+        result_lines.append("\n")
+    result_lines.append(f"[{name}]\n")
+    result_lines.extend(body_lines)
+
+for name in ("features", "otel"):
+    if name not in section_spans:
+        append_section(result, name, managed_sections[name]([]))
+
+new_text = "".join(result)
+if new_text and not new_text.endswith("\n"):
+    new_text += "\n"
+
+if not path.exists():
+    path.write_text(new_text, encoding="utf-8")
+    print("created")
+elif new_text != original_text:
+    path.write_text(new_text, encoding="utf-8")
     print("updated")
-    raise SystemExit(0)
-
-for index in range(features_start + 1, len(lines)):
-    if header_re.match(lines[index]):
-        features_end = index
-        break
-
-for index in range(features_start + 1, features_end):
-    match = setting_re.match(lines[index])
-    if not match:
-        continue
-    if match.group(2) == "true":
-        print("already_configured")
-        raise SystemExit(0)
-    lines[index] = f"{match.group(1)}codex_hooks = true{match.group(3)}\n"
-    path.write_text("".join(lines), encoding="utf-8")
-    print("updated")
-    raise SystemExit(0)
-
-lines.insert(features_end, "codex_hooks = true\n")
-path.write_text("".join(lines), encoding="utf-8")
-print("updated")
-' "$CODEX_CONFIG_TOML")"
+else:
+    print("already_configured")
+' "$CODEX_CONFIG_TOML" "$OTEL_ENDPOINT")"
 
   case "$CODEX_CONFIG_SUMMARY" in
     created)
-      echo "Configured ${CODEX_CONFIG_TOML} with codex_hooks = true"
+      echo "Configured ${CODEX_CONFIG_TOML} with codex_hooks and OTel Collector endpoint"
       ;;
     updated)
-      echo "Updated ${CODEX_CONFIG_TOML} to set codex_hooks = true"
+      echo "Updated ${CODEX_CONFIG_TOML} with codex_hooks and OTel Collector endpoint"
       ;;
   esac
 }
@@ -1136,6 +1239,7 @@ OK Codex S3 Archive installed
   Provider:    ${PROVIDER}
   Bucket:      ${BUCKET}
   User ID:     ${USER_ID}
+  OTel Collector: ${OTEL_ENDPOINT}
   Codex config: ${CODEX_CONFIG_SUMMARY}
   Service:     ${SERVICE_SUMMARY}
   Smoke test:  ${SMOKE_TEST_STATUS}
@@ -1150,6 +1254,7 @@ main() {
   detect_python
   parse_cli_args "$@"
   load_existing_install_state
+  load_existing_codex_config_state
 
   [ "$CLI_USER_ID" -eq 1 ] || USER_ID=""
   [ "$CLI_PROVIDER" -eq 1 ] || PROVIDER=""
@@ -1159,6 +1264,7 @@ main() {
   [ "$CLI_R2_ACCOUNT_ID" -eq 1 ] || R2_ACCOUNT_ID=""
   [ "$CLI_ACCESS_KEY_ID" -eq 1 ] || ACCESS_KEY_ID=""
   [ "$CLI_SECRET_ACCESS_KEY" -eq 1 ] || SECRET_ACCESS_KEY=""
+  [ "$CLI_OTEL_ENDPOINT" -eq 1 ] || OTEL_ENDPOINT=""
 
   if [ "$HAS_EXISTING_INSTALL" -eq 1 ]; then
     prompt_yes_no should_clear_runtime_state "Existing install detected. Clear pending queue and transient runtime state before reinstall?" "y"
@@ -1176,7 +1282,7 @@ main() {
   download_scripts
   write_credentials_json
   write_config_json
-  ensure_codex_features_config
+  ensure_codex_config
   merge_hooks_json
   warmup_daemon_runtime
   install_service
