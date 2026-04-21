@@ -208,17 +208,45 @@ stop_and_remove_service() {
 }
 
 restore_hooks_json() {
-  local latest_backup=""
+  local restore_backup=""
   local candidate
-  for candidate in "${HOME}"/.codex/hooks.json.bak.*; do
-    if [ -f "$candidate" ]; then
-      latest_backup="$candidate"
+  for candidate in $(printf '%s\n' "${HOME}"/.codex/hooks.json.bak.* 2>/dev/null | sort -r); do
+    if [ ! -f "$candidate" ]; then
+      continue
+    fi
+
+    if "${PYTHON3_PATH}" -c '
+import json
+import pathlib
+import sys
+
+hooks_path = pathlib.Path(sys.argv[1])
+managed_commands = set(sys.argv[2:])
+
+data = json.loads(hooks_path.read_text(encoding="utf-8"))
+stop_entries = data.get("hooks", {}).get("Stop", [])
+for entry in stop_entries:
+    hooks = entry.get("hooks", [])
+    if not isinstance(hooks, list):
+        continue
+    for hook in hooks:
+        if (
+            isinstance(hook, dict)
+            and hook.get("type") == "command"
+            and hook.get("command") in managed_commands
+        ):
+            raise SystemExit(1)
+
+raise SystemExit(0)
+' "$candidate" "$ARCHIVE_HOOK_COMMAND" "$WRAPPER_COMMAND" "$LEGACY_ARCHIVE_HOOK_COMMAND" "$LEGACY_WRAPPER_COMMAND"; then
+      restore_backup="$candidate"
+      break
     fi
   done
 
-  if [ -n "$latest_backup" ]; then
-    cp "$latest_backup" "$HOOKS_JSON"
-    HOOKS_RESTORE_SUMMARY="restored from $(basename "$latest_backup")"
+  if [ -n "$restore_backup" ]; then
+    cp "$restore_backup" "$HOOKS_JSON"
+    HOOKS_RESTORE_SUMMARY="restored from $(basename "$restore_backup")"
     return 0
   fi
 

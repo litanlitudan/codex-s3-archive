@@ -543,6 +543,11 @@ import pathlib
 import re
 import sys
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
+
 path = pathlib.Path(sys.argv[1])
 otel_endpoint = sys.argv[2]
 
@@ -565,10 +570,12 @@ for index, line in enumerate(lines):
         continue
     sections.append((match.group(1).strip(), index))
 
-section_spans = {}
+section_bounds = []
 for idx, (name, start) in enumerate(sections):
     end = sections[idx + 1][1] if idx + 1 < len(sections) else len(lines)
-    section_spans[name] = (start, end)
+    section_bounds.append((name, start, end))
+
+existing_section_names = {name for name, _, _ in section_bounds}
 
 def trim_trailing_blank_lines(section_lines):
     trimmed = list(section_lines)
@@ -588,6 +595,9 @@ def update_features_body(body_lines):
     return updated
 
 def update_otel_body(body_lines):
+    # Drop any pre-existing log_user_prompt or exporter = ... entries so we
+    # can re-emit a single canonical inline definition. Multi-line inline
+    # tables are swallowed by tracking brace balance.
     updated = []
     skip_exporter = False
     brace_balance = 0
@@ -623,12 +633,20 @@ managed_sections = {
     "otel": update_otel_body,
 }
 
+def is_conflicting_otel_subsection(name):
+    # Inline `exporter = { otlp-grpc = {...} }` inside [otel] fully defines
+    # otel.exporter. Any explicit [otel.exporter] or nested [otel.exporter.*]
+    # header would then re-define the same key and fail TOML parsing, so we
+    # drop those subsections entirely.
+    return name == "otel.exporter" or name.startswith("otel.exporter.")
+
 result = []
 cursor = 0
-for name, start in sections:
-    end = section_spans[name][1]
+for name, start, end in section_bounds:
     result.extend(lines[cursor:start])
-    if name in managed_sections:
+    if is_conflicting_otel_subsection(name):
+        pass  # drop to avoid duplicate exporter definitions
+    elif name in managed_sections:
         body = managed_sections[name](lines[start + 1:end])
         result.append(f"[{name}]\n")
         result.extend(body)
@@ -646,12 +664,21 @@ def append_section(result_lines, name, body_lines):
     result_lines.extend(body_lines)
 
 for name in ("features", "otel"):
-    if name not in section_spans:
+    if name not in existing_section_names:
         append_section(result, name, managed_sections[name]([]))
 
 new_text = "".join(result)
 if new_text and not new_text.endswith("\n"):
     new_text += "\n"
+
+if tomllib is not None:
+    try:
+        tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError as exc:
+        sys.stderr.write(
+            f"ERROR: refusing to write invalid {path}: {exc}\n"
+        )
+        sys.exit(1)
 
 if not path.exists():
     path.write_text(new_text, encoding="utf-8")
